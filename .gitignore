@@ -19,6 +19,7 @@ datasets/
 # logs
 logs/
 runs/
+wandb/
 
 # OS
 .DS_Store
