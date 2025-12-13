@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.pyc
+
+# virtual env
+venv/
+.venv/
+
+# data
+data/
+datasets/
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.csv
+*.mp4
+
+# logs
+logs/
+runs/
+
+# OS
+.DS_Store
