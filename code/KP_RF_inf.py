@@ -201,6 +201,84 @@ def visualize_trajectory_with_time(z_history_list, start_nodes, title="Trajector
 # 冒頭のimportに追加が必要
 from mpl_toolkits.mplot3d import Axes3D 
 
+def visualize_divergence_2d(z_history_list, start_node, title_suffix=""):
+    """
+    同じ開始ノードからの複数の軌跡(z_history_list)を2次元PCAで重ねて描画する
+    """
+    # 5回分のデータを結合してPCAを学習 (軸を統一するため)
+    all_z = np.concatenate(z_history_list, axis=0)
+    pca = PCA(n_components=2)
+    pca.fit(all_z)
+    
+    plt.figure(figsize=(10, 8))
+    cmap = plt.get_cmap('tab10') # 試行ごとに色を変える
+    
+    for i, z_hist in enumerate(z_history_list):
+        z_2d = pca.transform(np.array(z_hist))
+        
+        # 軌跡を描画
+        plt.plot(z_2d[:, 0], z_2d[:, 1], 
+                 marker='.', markersize=3, alpha=0.6, 
+                 label=f'Trial {i+1}', color=cmap(i))
+        
+        # 始点（全部同じはずだが念のため）
+        plt.scatter(z_2d[0, 0], z_2d[0, 1], c='black', s=100, marker='*')
+        # 終点
+        plt.scatter(z_2d[-1, 0], z_2d[-1, 1], c=cmap(i), s=80, marker='x')
+
+    plt.title(f"2D Divergence Analysis (Start Node: {start_node})")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.legend()
+    plt.grid(True)
+    
+    plt.savefig(stamp(f"div_2d_node{start_node}_{run_id}.png"))
+    plt.close()
+
+def visualize_divergence_3d(z_history_list, start_node):
+    """
+    同じ開始ノードからの複数の軌跡を3次元PCAで重ねて描画する
+    """
+    all_z = np.concatenate(z_history_list, axis=0)
+    pca = PCA(n_components=3)
+    pca.fit(all_z)
+    
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
+    cmap = plt.get_cmap('tab10')
+    
+    for i, z_hist in enumerate(z_history_list):
+        z_3d = pca.transform(np.array(z_hist))
+        
+        # 線を描画
+        ax.plot(z_3d[:, 0], z_3d[:, 1], z_3d[:, 2], 
+                alpha=0.6, label=f'Trial {i+1}', color=cmap(i))
+        
+        # 始点と終点
+        ax.scatter(z_3d[0, 0], z_3d[0, 1], z_3d[0, 2], c='black', s=50, marker='*')
+        ax.scatter(z_3d[-1, 0], z_3d[-1, 1], z_3d[-1, 2], c=[cmap(i)], s=50, marker='x')
+
+    ax.set_title(f"3D Divergence Analysis (Start Node: {start_node})")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3")
+    ax.legend()
+    
+
+    # パターン2: 上から見る
+    ax.view_init(elev=80, azim=0)
+    plt.savefig(stamp(f"div_3d1_node{start_node}_{run_id}.png"))
+    
+    # パターン3: 横から見る
+    ax.view_init(elev=0, azim=90)
+    plt.savefig(stamp(f"div_3d2_node{start_node}_{run_id}.png"))
+
+    # 見やすい角度で保存 (上から俯瞰)
+    plt.savefig(stamp(f"div_3d3_node{start_node}_{run_id}.png"))
+    
+    plt.close()
+
+
 def visualize_trajectory_3d(z_history_list, start_nodes, title="Trajectories_3D"):
     """
     軌跡を3次元でプロットする関数
@@ -260,50 +338,54 @@ def visualize_trajectory_3d(z_history_list, start_nodes, title="Trajectories_3D"
     print(f"3D Trajectory plots saved as {title}_*.png")
 
 def main():
-    # 1. Networkの準備 (学習時と同様にダミー特徴量で初期化)
+# 1. 準備 (既存と同じ)
     if not os.path.exists(ADJ_PATH):
-        print(f"Error: Adjacency matrix not found at {ADJ_PATH}")
+        print(f"Error: Adjacency matrix not found.")
         return
-
     adj_matrix = torch.load(ADJ_PATH, weights_only=True)
     dummy_node_features = torch.zeros((len(adj_matrix), 1))
     network = Network(adj_matrix, dummy_node_features)
     
-    # 2. モデルファイルの特定
+    # モデルロード (MODEL_PATHがNoneなら自動検索)
     model_path = MODEL_PATH
     if model_path is None:
-        # runsフォルダから一番新しいpthファイルを探す
+        import glob
         search_dir = "/home/mizutani/projects/RF/runs/"
         pth_files = glob.glob(os.path.join(search_dir, "*", "*.pth"))
         if not pth_files:
-            print("No .pth files found in runs directory. Please specify MODEL_PATH manually.")
             return
-        # 更新日時が新しい順にソート
         model_path = max(pth_files, key=os.path.getctime)
     
-    if not os.path.exists(model_path):
-        print(f"Error: Model file not found at {model_path}")
-        return
-
-    # 3. モデルロード
     model, config = load_model(model_path, network)
     
-    # 1. 固有値解析を実行（ぜひ一度見てみてください）
-    analyze_eigenvalues(model)
+    # 2. 検証したいノードのリスト
+    # 例: 0, 1, 3番など、動きがありそうなノードを指定
+    target_start_nodes = [0, 1, 5, 11] 
     
-    # 2. まとめて推論して可視化
-    all_z_histories = []
-    target_start_nodes = [0, 1, 2, 3, 4, 5, 6, 7] # 試したいノード
-    
-    for start_node in target_start_nodes:
-        # sampleモードで生成
-        route, z_hist = generate_route(model, network, start_node, strategy="sample")
-        all_z_histories.append(z_hist)
-        
-    # 3. グラデーション付きで可視化
-    visualize_trajectory_with_time(all_z_histories, target_start_nodes, title="all_trajectories_colored")
+    # 試行回数
+    N_TRIALS = 5
 
-    visualize_trajectory_3d(all_z_histories, target_start_nodes, title="all_trajectories_3d")
+    print(f"\n=== Starting Divergence Analysis ({N_TRIALS} trials per node) ===\n")
+
+    for start_node in target_start_nodes:
+        print(f"Processing Start Node: {start_node}")
+        
+        # このノードに対する N回分の履歴を貯めるリスト
+        trials_z_history = []
+        
+        for i in range(N_TRIALS):
+            # sampleモードで生成 (毎回違う結果になるはず)
+            route, z_hist = generate_route(model, network, start_node, 
+                                         max_len=50, 
+                                         strategy="sample", 
+                                         temperature=1.0) # temperatureでばらつき調整可
+            trials_z_history.append(z_hist)
+            print(f"  Trial {i+1}: Route len={len(route)}")
+            
+        # 3. 可視化実行 (このノード専用の図を出力)
+        visualize_divergence_2d(trials_z_history, start_node)
+        visualize_divergence_3d(trials_z_history, start_node)
+        print("-" * 30)
 
 if __name__ == "__main__":
     main()
