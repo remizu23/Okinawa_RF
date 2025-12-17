@@ -10,44 +10,139 @@ from mpl_toolkits.mplot3d import Axes3D
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import numpy as np
+import torch.nn.functional as F
 
-
+# =========================================================
+#  設定：出力先ディレクトリ
+# =========================================================
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_dir = f"/home/mizutani/projects/RF/runs/figure2"
+# 保存先フォルダ
+out_dir = f"/home/mizutani/projects/RF/runs/comparison_{run_id}"
 os.makedirs(out_dir, exist_ok=True)
 
 def stamp(name):
     return os.path.join(out_dir, name)
 
 # =========================================================
-#  設定：ここを自分の環境に合わせて書き換えてください
+#  設定：モデルとデータのパス
 # =========================================================
-# 学習済みモデルのパス (.pthファイル)
-# 例: "/home/mizutani/projects/RF/runs/202502XX_XXXXXX/model_weights_xxxx.pth"
-# ※自動で最新のモデルを探すロジックも main() に入れていますが、指定すると確実です
+# 学習済みモデルのパス
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_184803/model_weights_20251217_184803.pth'
 
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_130327/model_weights_20251217_130327.pth'
-
-# 隣接行列のパス (学習時と同じもの)
+# 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
 
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# =========================================================
+#  1. 評価指標の計算ロジック (維持)
+# =========================================================
+
+def levenshtein_distance(seq1, seq2):
+    size_x = len(seq1) + 1
+    size_y = len(seq2) + 1
+    matrix = np.zeros((size_x, size_y))
+    for x in range(size_x): matrix[x, 0] = x
+    for y in range(size_y): matrix[0, y] = y
+
+    for x in range(1, size_x):
+        for y in range(1, size_y):
+            if seq1[x-1] == seq2[y-1]:
+                matrix[x,y] = min(
+                    matrix[x-1, y] + 1,
+                    matrix[x-1, y-1],
+                    matrix[x, y-1] + 1
+                )
+            else:
+                matrix[x,y] = min(
+                    matrix[x-1,y] + 1,
+                    matrix[x-1,y-1] + 1,
+                    matrix[x,y-1] + 1
+                )
+    return matrix[size_x-1, size_y-1]
+
+def evaluate_metrics(model, network, device):
+    """
+    データセットを使ってモデルの定量性能(Accuracy, Edit Distance)を評価する
+    """
+    print("\n=== Evaluating Quantitative Metrics ===")
+    
+    # データのロード (Trainと同じ手順)
+    # ※パスは環境に合わせて修正してください
+    trip_arrz = np.load('/home/mizutani/projects/RF/data/input_a.npz')
+    trip_arr = trip_arrz['route_arr']
+    route = torch.from_numpy(trip_arr)
+    
+    # 時間短縮のためサンプル数を制限 (全データなら len(route))
+    num_samples = min(len(route), 1000) 
+    subset_route = route[:num_samples]
+    
+    tokenizer = Tokenization(network)
+    model.eval()
+    
+    total_acc = 0
+    total_tokens = 0
+    total_edit_dist = 0
+    
+    batch_size = 64
+    num_batches = (len(subset_route) + batch_size - 1) // batch_size
+    
+    with torch.no_grad():
+        for i in range(num_batches):
+            batch_routes = subset_route[i*batch_size : (i+1)*batch_size].to(device)
+            
+            # 入力と正解
+            input_tokens = tokenizer.tokenization(batch_routes, mode="simple").long().to(device)
+            target_tokens = tokenizer.tokenization(batch_routes, mode="next").long().to(device)
+            
+            # 推論
+            logits, _, _ = model(input_tokens)
+            preds = torch.argmax(logits, dim=-1) # [B, T]
+            
+            # --- Accuracy ---
+            # パディング(network.N)以外の部分で正解率を計算
+            mask = target_tokens != network.N 
+            correct = (preds == target_tokens) & mask
+            
+            total_acc += correct.sum().item()
+            total_tokens += mask.sum().item()
+            
+            # --- Edit Distance ---
+            for j in range(len(batch_routes)):
+                # tensor -> list (padding除去)
+                p_seq = preds[j][mask[j]].cpu().tolist()
+                t_seq = target_tokens[j][mask[j]].cpu().tolist()
+                
+                dist = levenshtein_distance(p_seq, t_seq)
+                total_edit_dist += dist
+
+    avg_acc = total_acc / total_tokens if total_tokens > 0 else 0
+    avg_edit = total_edit_dist / num_samples
+    
+    print(f"Samples: {num_samples}")
+    print(f"Next Token Accuracy: {avg_acc:.4f} (Higher is better)")
+    print(f"Avg Edit Distance:   {avg_edit:.4f} (Lower is better)")
+    print("=======================================\n")
+    return avg_acc, avg_edit
+
+# =========================================================
+#  2. モデル関連関数
 # =========================================================
 
 def load_model(model_path, network):
-    """保存されたファイルからモデルを復元する"""
     print(f"Loading model from: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
     
-    # 保存しておいた設定(config)を取り出す
     if 'config' not in checkpoint:
-        raise ValueError("Config not found in checkpoint. Make sure to use the latest training code.")
+        raise ValueError("Config not found in checkpoint.")
         
     config = checkpoint['config']
-    print(f"Model Config: {config}")
+    
+    # Koopman設定の表示
+    use_koopman = config.get('use_koopman_loss', 'Unknown')
+    print(f"Model Config - Use Koopman: {use_koopman}")
 
-    # モデルの再構築 (configを使うのでパラメータ変更不要)
     model = KoopmanRoutesFormer(
         vocab_size=config['vocab_size'],
         token_emb_dim=config['token_emb_dim'],
@@ -59,333 +154,234 @@ def load_model(model_path, network):
         pad_token_id=config['pad_token_id']
     )
     
-    # 重みのロード
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
-    model.eval() # 推論モードへ
+    model.eval()
     
     return model, config
 
-import torch.nn.functional as F # 追加が必要ならファイルの冒頭に
-
 def generate_route(model, network, start_node_id, max_len=50, strategy="sample", temperature=1.0):
-    """
-    strategy: "greedy" (最大確率), "sample" (確率的), "no_stay" (滞在禁止)
-    temperature: 確率分布の平坦化 (高いほどランダム、低いほど保守的)
-    """
     tokenizer = Tokenization(network)
     TOKEN_START = tokenizer.SPECIAL_TOKENS["<b>"]
     TOKEN_END   = tokenizer.SPECIAL_TOKENS["<e>"]
     
     current_seq = [TOKEN_START, start_node_id]
-    z_history = [] # ★ zを記録するリスト 
-    
-    print(f"Generating route... Start Node: {start_node_id}")
+    z_history = [] 
     
     with torch.no_grad():
         for _ in range(max_len):
             input_tensor = torch.tensor([current_seq], dtype=torch.long).to(device)
             
-            # z_hat (Transformerの推定値) を受け取る
             logits, z_hat, z_pred = model(input_tensor)
 
-            # 最新時刻の z を取得して保存 (CPUに移してnumpy化)
             last_z = z_hat[0, -1, :].cpu().numpy()
             z_history.append(last_z)
 
             last_logits = logits[0, -1, :]
             
-            # --- 戦略ごとの処理 ---
-            
-            # 戦略1: "no_stay" (強制移動モード)
-            # 現在の場所(current_node)の確率を強制的にマイナス無限大にして選ばせない
             if strategy == "no_stay":
                 current_node = current_seq[-1]
                 last_logits[current_node] = float('-inf')
-                # ついでに特殊トークン<b>なども選ばせない
                 last_logits[TOKEN_START] = float('-inf')
 
-            # 確率分布に変換 (Temperature付き)
-            # temp < 1.0 : 確率高いものをより強調
-            # temp > 1.0 : いろんな可能性を試す
             probs = F.softmax(last_logits / temperature, dim=0)
             
             if strategy == "greedy":
                 next_token = torch.argmax(probs).item()
             else:
-                # strategy="sample" or "no_stay" の場合は確率で抽選する
                 next_token = torch.multinomial(probs, num_samples=1).item()
             
-            # --- ループ終了判定 ---
             current_seq.append(next_token)
             if next_token == TOKEN_END:
                 break
                 
     return current_seq, z_history
 
+# =========================================================
+#  3. 可視化ロジック (グラデーション表示・複数地点)
+# =========================================================
 
 def analyze_eigenvalues(model):
-    """
-    行列Aの固有値を解析・可視化する関数
-    これが「円の内側」にあれば、システムは安定的です。
-    """
-    # 学習済み行列 A を取得 (tensor -> numpy)
+    """固有値解析"""
     A_matrix = model.A.detach().cpu().numpy()
-    
-    # 固有値を計算
     eigenvalues, _ = np.linalg.eig(A_matrix)
     
-    # プロット
     plt.figure(figsize=(6, 6))
-    
-    # 単位円を描く
     theta = np.linspace(0, 2*np.pi, 100)
     plt.plot(np.cos(theta), np.sin(theta), linestyle='--', color='gray', label='Unit Circle')
-    
-    # 固有値をプロット
-    plt.scatter(eigenvalues.real, eigenvalues.imag, color='blue', marker='x', s=100, label='Eigenvalues of A')
-    
+    plt.scatter(eigenvalues.real, eigenvalues.imag, color='blue', marker='x', s=100, label='Eigenvalues')
     plt.axhline(0, color='black', linewidth=0.5)
     plt.axvline(0, color='black', linewidth=0.5)
     plt.title("Eigenvalues of Koopman Matrix A")
-    plt.xlabel("Real Part")
-    plt.ylabel("Imaginary Part")
     plt.grid(True)
-    plt.legend()
-    plt.axis('equal') # 縦横比を同じにする
+    plt.axis('equal')
     
-    # 保存
-    plt.savefig(stamp(f"eigenvalues_{run_id}.png"))
-    print("Eigenvalue plot saved to eigenvalues_analysis.png")
-
-def visualize_trajectory_with_time(z_history_list, start_nodes, title="Trajectories"):
-    """
-    複数の軌跡を、時間グラデーション付きでプロットする
-    z_history_list: 各試行のzの履歴のリスト
-    start_nodes: 各試行の開始ノード番号
-    """
-    # 全データをまとめてPCAにかける（空間を統一するため）
-    all_z = np.concatenate(z_history_list, axis=0)
-    pca = PCA(n_components=2)
-    pca.fit(all_z)
-    
-    plt.figure(figsize=(10, 8))
-    
-    # カラーマップ (時間経過用)
-    cmap = plt.get_cmap('viridis')
-    
-    for i, z_hist in enumerate(z_history_list):
-        # この軌跡をPCA変換
-        z_2d = pca.transform(np.array(z_hist))
-        
-        # 時間の長さ
-        T = len(z_2d)
-        
-        # 線を描画（薄く）
-        plt.plot(z_2d[:, 0], z_2d[:, 1], color='gray', alpha=0.3, linewidth=1)
-        
-        # 点を描画（時間経過で色を変える）
-        # c=range(T) で時間による色付け
-        sc = plt.scatter(z_2d[:, 0], z_2d[:, 1], c=range(T), cmap=cmap, s=30, vmin=0, vmax=50, edgecolor='none')
-        
-        # スタート地点に番号を表示
-        plt.text(z_2d[0, 0], z_2d[0, 1], str(start_nodes[i]), fontsize=12, fontweight='bold', color='red')
-
-    plt.colorbar(sc, label='Time Step')
-    plt.title(f"Koopman Latent Trajectories (PCA)")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.grid(True)
-    plt.savefig(stamp(f"PCA_{run_id}.png"))
-
-# 冒頭のimportに追加が必要
-from mpl_toolkits.mplot3d import Axes3D 
-
-def visualize_divergence_2d(z_history_list, start_node, title_suffix=""):
-    """
-    同じ開始ノードからの複数の軌跡(z_history_list)を2次元PCAで重ねて描画する
-    """
-    # 5回分のデータを結合してPCAを学習 (軸を統一するため)
-    all_z = np.concatenate(z_history_list, axis=0)
-    pca = PCA(n_components=2)
-    pca.fit(all_z)
-    
-    plt.figure(figsize=(10, 8))
-    cmap = plt.get_cmap('tab10') # 試行ごとに色を変える
-    
-    for i, z_hist in enumerate(z_history_list):
-        z_2d = pca.transform(np.array(z_hist))
-        
-        # 軌跡を描画
-        plt.plot(z_2d[:, 0], z_2d[:, 1], 
-                 marker='.', markersize=3, alpha=0.6, 
-                 label=f'Trial {i+1}', color=cmap(i))
-        
-        # 始点（全部同じはずだが念のため）
-        plt.scatter(z_2d[0, 0], z_2d[0, 1], c='black', s=100, marker='*')
-        # 終点
-        plt.scatter(z_2d[-1, 0], z_2d[-1, 1], c=cmap(i), s=80, marker='x')
-
-    plt.title(f"2D Divergence Analysis (Start Node: {start_node})")
-    plt.xlabel("PC1")
-    plt.ylabel("PC2")
-    plt.legend()
-    plt.grid(True)
-    
-    plt.savefig(stamp(f"div_2d_node{start_node}_{run_id}.png"))
+    save_path = stamp("eigenvalues.png")
+    plt.savefig(save_path)
     plt.close()
+    print(f"Saved eigenvalues plot: {save_path}")
 
-def visualize_divergence_3d(z_history_list, start_node):
+def visualize_trajectory_with_time(z_history_list, routes_list, start_nodes, title="Trajectories"):
     """
-    同じ開始ノードからの複数の軌跡を3次元PCAで重ねて描画する
-    """
-    all_z = np.concatenate(z_history_list, axis=0)
-    pca = PCA(n_components=3)
-    pca.fit(all_z)
-    
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    cmap = plt.get_cmap('tab10')
-    
-    for i, z_hist in enumerate(z_history_list):
-        z_3d = pca.transform(np.array(z_hist))
-        
-        # 線を描画
-        ax.plot(z_3d[:, 0], z_3d[:, 1], z_3d[:, 2], 
-                alpha=0.6, label=f'Trial {i+1}', color=cmap(i))
-        
-        # 始点と終点
-        ax.scatter(z_3d[0, 0], z_3d[0, 1], z_3d[0, 2], c='black', s=50, marker='*')
-        ax.scatter(z_3d[-1, 0], z_3d[-1, 1], z_3d[-1, 2], c=[cmap(i)], s=50, marker='x')
-
-    ax.set_title(f"3D Divergence Analysis (Start Node: {start_node})")
-    ax.set_xlabel("PC1")
-    ax.set_ylabel("PC2")
-    ax.set_zlabel("PC3")
-    ax.legend()
-    
-
-    # パターン2: 上から見る
-    ax.view_init(elev=80, azim=0)
-    plt.savefig(stamp(f"div_3d1_node{start_node}_{run_id}.png"))
-    
-    # パターン3: 横から見る
-    ax.view_init(elev=0, azim=90)
-    plt.savefig(stamp(f"div_3d2_node{start_node}_{run_id}.png"))
-
-    # 見やすい角度で保存 (上から俯瞰)
-    plt.savefig(stamp(f"div_3d3_node{start_node}_{run_id}.png"))
-    
-    plt.close()
-
-
-def visualize_trajectory_3d(z_history_list, start_nodes, title="Trajectories_3D"):
-    """
-    軌跡を3次元でプロットする関数
+    複数の軌跡を、時間グラデーション付きで2次元プロットし、各点にノード番号を表示する
+    routes_list: 生成されたルートIDのリスト (z_history_listと対応)
     """
     # 全データをまとめてPCAにかける
     all_z = np.concatenate(z_history_list, axis=0)
-    
-    # ★変更点1: 3次元に圧縮
-    pca = PCA(n_components=3)
+    pca = PCA(n_components=2)
     pca.fit(all_z)
     
-    fig = plt.figure(figsize=(10, 8))
-    # ★変更点2: 3D projectionを指定
-    ax = fig.add_subplot(111, projection='3d')
-    
-    # カラーマップ
+    plt.figure(figsize=(12, 10)) # 少し大きくする
     cmap = plt.get_cmap('viridis')
     
     for i, z_hist in enumerate(z_history_list):
-        # 変換 (Steps, 3)
+        z_2d = pca.transform(np.array(z_hist))
+        route = routes_list[i]
+        
+        # 線を描画
+        plt.plot(z_2d[:, 0], z_2d[:, 1], color='gray', alpha=0.3, linewidth=1)
+        
+        # 点を描画
+        sc = plt.scatter(z_2d[:, 0], z_2d[:, 1], c=range(len(z_2d)), cmap=cmap, s=30, vmin=0, vmax=50, edgecolor='none')
+        
+        # ★改良点: 各点にノード番号を表示
+        # z_hist[k] は route[k+1] (Start Node以降) に対応します
+        for k in range(len(z_2d)):
+            # 対応するノードID
+            # routeは [<b>, start, next1, ...] なので、z_hist[0]に対応するのは route[1]
+            if k + 1 < len(route):
+                node_id = route[k+1]
+                
+                # スタート地点(k=0)は赤く太字で、それ以外は小さく表示
+                if k == 0:
+                    plt.text(z_2d[k, 0], z_2d[k, 1], str(node_id), fontsize=12, fontweight='bold', color='red', zorder=10)
+                else:
+                    # 文字が重ならないように少しずらす
+                    plt.text(z_2d[k, 0]+0.02, z_2d[k, 1]+0.02, str(node_id), fontsize=8, color='black')
+
+    plt.colorbar(sc, label='Time Step')
+    plt.title(f"Koopman Latent Trajectories (2D PCA) with Node IDs")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.grid(True)
+
+    save_path = stamp(f"{title}_2d.png")
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved 2D plot: {save_path}")
+
+def visualize_trajectory_3d(z_history_list, routes_list, start_nodes, title="Trajectories"):
+    """
+    軌跡を3次元でプロットし、各点にノード番号を表示する
+    """
+    all_z = np.concatenate(z_history_list, axis=0)
+    
+    pca = PCA(n_components=3)
+    pca.fit(all_z)
+    
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    cmap = plt.get_cmap('viridis')
+    
+    for i, z_hist in enumerate(z_history_list):
         z_3d = pca.transform(np.array(z_hist))
-        T = len(z_3d)
+        route = routes_list[i]
         
-        # 線を描画 (x, y, z)
         ax.plot(z_3d[:, 0], z_3d[:, 1], z_3d[:, 2], color='gray', alpha=0.3, linewidth=1)
-        
-        # 点を描画 (時間経過で色変え)
         sc = ax.scatter(z_3d[:, 0], z_3d[:, 1], z_3d[:, 2], 
-                        c=range(T), cmap=cmap, s=20, vmin=0, vmax=50)
+                        c=range(len(z_3d)), cmap=cmap, s=20, vmin=0, vmax=50)
         
-        # スタート地点に番号
-        ax.text(z_3d[0, 0], z_3d[0, 1], z_3d[0, 2], 
-                str(start_nodes[i]), fontsize=10, fontweight='bold', color='red')
+        # ★改良点: 3D空間でのテキスト表示
+        for k in range(len(z_3d)):
+            if k + 1 < len(route):
+                node_id = route[k+1]
+                if k == 0:
+                    ax.text(z_3d[k, 0], z_3d[k, 1], z_3d[k, 2], str(node_id), fontsize=10, fontweight='bold', color='red')
+                else:
+                    ax.text(z_3d[k, 0], z_3d[k, 1], z_3d[k, 2], str(node_id), fontsize=6, color='black')
 
     ax.set_title(f"Koopman Latent Trajectories (3D PCA)")
     ax.set_xlabel("PC1")
     ax.set_ylabel("PC2")
-    ax.set_zlabel("PC3") # Z軸ラベル
-    
+    ax.set_zlabel("PC3")
     fig.colorbar(sc, label='Time Step', pad=0.1)
-    
-    # ★ポイント: 静止画だと3Dは分かりにくいので、視点(角度)を変えて保存すると良いです
-    # view_init(elev=仰角, azim=方位角)
-    
-    # パターン1: 標準的な角度
+
+    # 視点を変えて3パターン保存
     ax.view_init(elev=30, azim=45)
-    plt.savefig(f"{title}_view1.png")
+    plt.savefig(stamp(f"{title}_3d_view1.png"))
     
-    # パターン2: 上から見る
     ax.view_init(elev=80, azim=0)
-    plt.savefig(f"{title}_top.png")
+    plt.savefig(stamp(f"{title}_3d_top.png"))
     
-    # パターン3: 横から見る
     ax.view_init(elev=0, azim=90)
-    plt.savefig(stamp(f"PCA3d_{run_id}.png"))
+    plt.savefig(stamp(f"{title}_3d_side.png"))
     
-    print(f"3D Trajectory plots saved as {title}_*.png")
+    plt.close()
+    print(f"Saved 3D plots to: {out_dir}")
+
 
 def main():
-# 1. 準備 (既存と同じ)
+    # 1. 準備
     if not os.path.exists(ADJ_PATH):
-        print(f"Error: Adjacency matrix not found.")
+        print(f"Error: Adjacency matrix not found at {ADJ_PATH}")
         return
+
     adj_matrix = torch.load(ADJ_PATH, weights_only=True)
     dummy_node_features = torch.zeros((len(adj_matrix), 1))
     network = Network(adj_matrix, dummy_node_features)
     
-    # モデルロード (MODEL_PATHがNoneなら自動検索)
+    # 2. モデルロード
     model_path = MODEL_PATH
     if model_path is None:
-        import glob
         search_dir = "/home/mizutani/projects/RF/runs/"
         pth_files = glob.glob(os.path.join(search_dir, "*", "*.pth"))
-        if not pth_files:
-            return
-        model_path = max(pth_files, key=os.path.getctime)
+        if pth_files:
+            model_path = max(pth_files, key=os.path.getctime)
     
+    if not os.path.exists(model_path):
+        print(f"Error: Model file not found at {model_path}")
+        return
+
     model, config = load_model(model_path, network)
     
-    # 2. 検証したいノードのリスト
-    # 例: 0, 1, 3番など、動きがありそうなノードを指定
-    target_start_nodes = [0, 1, 5, 11] 
+    # ★ 3. 定量評価の実行 (Accuracy, EditDistance)
+    acc, edit_dist = evaluate_metrics(model, network, device)
+
+    # 結果をテキストファイルに書き込む
+    metrics_file = stamp(f"metrics_{run_id}.txt")
+
+    with open(metrics_file, "w") as f:
+        f.write("=== Quantitative Metrics ===\n")
+        f.write(f"Run ID: {run_id}\n")
+        f.write(f"Model Path: {model_path}\n")
+        f.write(f"Use Koopman: {config.get('use_koopman_loss', 'Unknown')}\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Next Token Accuracy: {acc:.4f}\n")
+        f.write(f"Avg Edit Distance:   {edit_dist:.4f}\n")
+        f.write("============================\n")
+
+    # ★ 4. 固有値解析
+    # analyze_eigenvalues(model)
     
-    # 試行回数
-    N_TRIALS = 5
+    # ★ 5. 複数ノードからの推論実行 & グラデーション可視化
+    all_z_histories = []
+    all_routes = [] # ★ルートを保存するリストを追加
 
-    print(f"\n=== Starting Divergence Analysis ({N_TRIALS} trials per node) ===\n")
-
+    # 可視化したいスタート地点のリスト
+    target_start_nodes = [0,1,2,3,4,5,6,7] 
+    
+    print(f"Generating routes from nodes: {target_start_nodes}")
+    
     for start_node in target_start_nodes:
-        print(f"Processing Start Node: {start_node}")
+        # sampleモードで1回生成
+        route, z_hist = generate_route(model, network, start_node, strategy="sample", temperature=1.0)
+        all_z_histories.append(z_hist)
+
+        all_routes.append(route) # ★保存
         
-        # このノードに対する N回分の履歴を貯めるリスト
-        trials_z_history = []
-        
-        for i in range(N_TRIALS):
-            # sampleモードで生成 (毎回違う結果になるはず)
-            route, z_hist = generate_route(model, network, start_node, 
-                                         max_len=50, 
-                                         strategy="sample", 
-                                         temperature=1.0) # temperatureでばらつき調整可
-            trials_z_history.append(z_hist)
-            print(f"  Trial {i+1}: Route len={len(route)}")
-            
-        # 3. 可視化実行 (このノード専用の図を出力)
-        visualize_divergence_2d(trials_z_history, start_node)
-        visualize_divergence_3d(trials_z_history, start_node)
-        print("-" * 30)
+    # 可視化 (2D & 3D)
+    visualize_trajectory_with_time(all_z_histories, all_routes, target_start_nodes, title="routes")
+    visualize_trajectory_3d(all_z_histories, all_routes, target_start_nodes, title="routes")
 
 if __name__ == "__main__":
     main()
