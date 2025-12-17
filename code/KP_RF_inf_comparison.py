@@ -1,3 +1,6 @@
+### 固定ルートをなぞってzの遷移を出す（１パラメータに対してのみ） ###
+
+
 import torch
 import os
 import glob
@@ -24,7 +27,7 @@ def stamp(name):
 
 # 比較したいモデルのパスを指定してください
 # ★ここにそれぞれのモデルパスを入れる
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_130327/model_weights_20251217_130327.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_184803/model_weights_20251217_184803.pth'
 
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

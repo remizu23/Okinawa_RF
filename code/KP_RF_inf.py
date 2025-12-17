@@ -27,7 +27,7 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_184803/model_weights_20251217_184803.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_203408/model_weights_20251217_203408.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -361,7 +361,7 @@ def main():
         f.write("============================\n")
 
     # ★ 4. 固有値解析
-    # analyze_eigenvalues(model)
+    analyze_eigenvalues(model)
     
     # ★ 5. 複数ノードからの推論実行 & グラデーション可視化
     all_z_histories = []

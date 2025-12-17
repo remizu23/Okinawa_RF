@@ -33,7 +33,7 @@ wandb.config = type("C", (), {
     
     # ★★★ Ablation Study用設定 ★★★
     "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
-    "koopman_alpha": 0.1       # Koopman Lossの重み
+    "koopman_alpha": 1       # Koopman Lossの重み
 })()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
