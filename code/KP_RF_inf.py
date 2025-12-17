@@ -5,6 +5,7 @@ from network import Network
 from tokenization import Tokenization
 from KP_RF import KoopmanRoutesFormer
 from datetime import datetime
+from mpl_toolkits.mplot3d import Axes3D
 
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
@@ -154,7 +155,7 @@ def analyze_eigenvalues(model):
     plt.axis('equal') # 縦横比を同じにする
     
     # 保存
-    plt.savefig(stamp("eigenvalues.png"))
+    plt.savefig(stamp(f"eigenvalues_{run_id}.png"))
     print("Eigenvalue plot saved to eigenvalues_analysis.png")
 
 def visualize_trajectory_with_time(z_history_list, start_nodes, title="Trajectories"):
@@ -195,9 +196,68 @@ def visualize_trajectory_with_time(z_history_list, start_nodes, title="Trajector
     plt.xlabel("PC1")
     plt.ylabel("PC2")
     plt.grid(True)
-    plt.savefig(stamp("PCA.png"))
+    plt.savefig(stamp(f"PCA_{run_id}.png"))
 
+# 冒頭のimportに追加が必要
+from mpl_toolkits.mplot3d import Axes3D 
 
+def visualize_trajectory_3d(z_history_list, start_nodes, title="Trajectories_3D"):
+    """
+    軌跡を3次元でプロットする関数
+    """
+    # 全データをまとめてPCAにかける
+    all_z = np.concatenate(z_history_list, axis=0)
+    
+    # ★変更点1: 3次元に圧縮
+    pca = PCA(n_components=3)
+    pca.fit(all_z)
+    
+    fig = plt.figure(figsize=(10, 8))
+    # ★変更点2: 3D projectionを指定
+    ax = fig.add_subplot(111, projection='3d')
+    
+    # カラーマップ
+    cmap = plt.get_cmap('viridis')
+    
+    for i, z_hist in enumerate(z_history_list):
+        # 変換 (Steps, 3)
+        z_3d = pca.transform(np.array(z_hist))
+        T = len(z_3d)
+        
+        # 線を描画 (x, y, z)
+        ax.plot(z_3d[:, 0], z_3d[:, 1], z_3d[:, 2], color='gray', alpha=0.3, linewidth=1)
+        
+        # 点を描画 (時間経過で色変え)
+        sc = ax.scatter(z_3d[:, 0], z_3d[:, 1], z_3d[:, 2], 
+                        c=range(T), cmap=cmap, s=20, vmin=0, vmax=50)
+        
+        # スタート地点に番号
+        ax.text(z_3d[0, 0], z_3d[0, 1], z_3d[0, 2], 
+                str(start_nodes[i]), fontsize=10, fontweight='bold', color='red')
+
+    ax.set_title(f"Koopman Latent Trajectories (3D PCA)")
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_zlabel("PC3") # Z軸ラベル
+    
+    fig.colorbar(sc, label='Time Step', pad=0.1)
+    
+    # ★ポイント: 静止画だと3Dは分かりにくいので、視点(角度)を変えて保存すると良いです
+    # view_init(elev=仰角, azim=方位角)
+    
+    # パターン1: 標準的な角度
+    ax.view_init(elev=30, azim=45)
+    plt.savefig(f"{title}_view1.png")
+    
+    # パターン2: 上から見る
+    ax.view_init(elev=80, azim=0)
+    plt.savefig(f"{title}_top.png")
+    
+    # パターン3: 横から見る
+    ax.view_init(elev=0, azim=90)
+    plt.savefig(stamp(f"PCA3d_{run_id}.png"))
+    
+    print(f"3D Trajectory plots saved as {title}_*.png")
 
 def main():
     # 1. Networkの準備 (学習時と同様にダミー特徴量で初期化)
@@ -243,6 +303,7 @@ def main():
     # 3. グラデーション付きで可視化
     visualize_trajectory_with_time(all_z_histories, target_start_nodes, title="all_trajectories_colored")
 
+    visualize_trajectory_3d(all_z_histories, target_start_nodes, title="all_trajectories_3d")
 
 if __name__ == "__main__":
     main()
