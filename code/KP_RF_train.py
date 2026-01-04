@@ -20,9 +20,9 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 200, 
+    "epochs": 300, 
     "batch_size": 256,
-    "d_ie": 24,
+    "d_ie": 64,
     "head_num": 4, 
     "d_ff": 32, 
     "B_de": 6,
@@ -32,8 +32,8 @@ wandb.config = type("C", (), {
     "savefilename": "model_weights.pth",
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
-    "koopman_alpha": 1       # Koopman Lossの重み
+    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "koopman_alpha": 0.1       # Koopman Lossの重み
 })()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,12 +46,13 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_c.npz') ##インプットを変えたら変える！
+
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 dummy_feature_dim = 1
 dummy_node_features = torch.zeros((len(adj_matrix), dummy_feature_dim))
 network = Network(adj_matrix, dummy_node_features)
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_a.npz')
 trip_arr = trip_arrz['route_arr']
 time_arr = trip_arrz['time_arr']
 

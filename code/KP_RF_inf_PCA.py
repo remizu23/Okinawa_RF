@@ -1,5 +1,4 @@
-### 両方指定し、同じPCAの掛け方をする ###
-
+### 個別にPCAをかけて可視化するバージョン ###
 
 import torch
 import os
@@ -64,15 +63,17 @@ def get_z_sequence(model, tokens):
         
         z_seq = z_hat[0].cpu().numpy()
         
-        # 線形性エラーの計算 ||z_{t+1} - A z_t||^2
-        # z_hatの未来(1~) と z_predの未来(0~last-1) を比較
-        z_true_next = z_hat[:, 1:, :]
-        z_pred_next = z_pred[:, :-1, :] # KP_RFの実装に合わせて調整が必要かもですが、基本はこれ
+        # 線形性エラーの計算 (参考値)
+        # z_hatの未来(1~) と z_pred(0~last-1から予測) を比較
+        # KP_RFの実装によっては z_pred は既にシフトされている可能性があるが、
+        # ここでは推論時の挙動として単純にmseをとる
         
-        # モデル実装依存: KP_RF.pyのforward戻り値を確認
-        # forward戻り値: logits, z_hat, z_pred_next (ここで既にA掛け算済みと仮定)
+        # shape合わせ: z_predは通常1ステップ未来を予測している
+        # z_hat[:, 1:] (t=1...T) vs z_pred[:, :-1] (t=0...T-1からの予測)
+        # ※モデルの実装詳細によるため、大まかな目安として
+        valid_len = min(z_hat.size(1)-1, z_pred.size(1))
+        mse = torch.nn.functional.mse_loss(z_pred[:, :valid_len, :], z_hat[:, 1:1+valid_len, :])
         
-        mse = torch.nn.functional.mse_loss(z_pred, z_hat[:, 1:, :])
         return z_seq, mse.item()
 
 def main():
@@ -115,7 +116,7 @@ def main():
     for idx in target_indices:
         tokens = tokenizer.tokenization(all_routes[idx].unsqueeze(0), mode="simple").long()[0].to(device)
         
-        # トリミング (Start削除, End以降削除)
+        # トリミング
         if tokens[0] == ID_START: tokens = tokens[1:]
         end_mask = (tokens == ID_PAD) | (tokens == ID_EOS)
         if end_mask.any():
@@ -130,7 +131,6 @@ def main():
         z_w, err_w = get_z_sequence(model_with, tokens)
         z_wo, err_wo = get_z_sequence(model_without, tokens)
         
-        # Startトークン分のzもトリミング(モデル内部処理によるが、tokensに合わせておく)
         z_w = z_w[:len(tokens)]
         z_wo = z_wo[:len(tokens)]
         
@@ -145,36 +145,47 @@ def main():
     print(f"Without Koopman (Avg MSE): {np.mean(errors_without):.6f}")
     print("====================================================")
 
-    # 6. PCA統一可視化
-    # 全データを結合してPCAを学習
-    all_z_concat = np.concatenate(data_with + data_without, axis=0)
-    pca = PCA(n_components=2)
-    pca.fit(all_z_concat)
+    # 6. PCA個別可視化 (ここを修正)
+    
+    # --- With Koopman 用のPCA ---
+    z_with_concat = np.concatenate(data_with, axis=0)
+    pca_w = PCA(n_components=2)
+    pca_w.fit(z_with_concat)
+
+    # --- Without Koopman 用のPCA ---
+    z_without_concat = np.concatenate(data_without, axis=0)
+    pca_wo = PCA(n_components=2)
+    pca_wo.fit(z_without_concat)
     
     # 描画
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), sharex=True, sharey=True)
-    # sharex, sharey=True により、軸のスケールが完全に統一される
+    # sharex, shareyはFalseにする（スケールや分布が異なるため）
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6)) 
     
     cmap = plt.get_cmap('tab10')
     
     # Plot With Koopman
     for i, z in enumerate(data_with):
-        z_2d = pca.transform(z)
+        z_2d = pca_w.transform(z)
         axes[0].plot(z_2d[:,0], z_2d[:,1], marker='.', color=cmap(i), label=f"Route {target_indices[i]}")
         axes[0].text(z_2d[0,0], z_2d[0,1], "S", color=cmap(i), fontweight='bold')
-    axes[0].set_title("With Koopman (Proposed)")
+    axes[0].set_title("With Koopman (Individual PCA)")
+    axes[0].set_xlabel("PC1")
+    axes[0].set_ylabel("PC2")
     axes[0].grid(True)
+    axes[0].legend()
     
     # Plot Without Koopman
     for i, z in enumerate(data_without):
-        z_2d = pca.transform(z)
+        z_2d = pca_wo.transform(z)
         axes[1].plot(z_2d[:,0], z_2d[:,1], marker='.', color=cmap(i))
         axes[1].text(z_2d[0,0], z_2d[0,1], "S", color=cmap(i), fontweight='bold')
-    axes[1].set_title("Without Koopman (Ablation)")
+    axes[1].set_title("Without Koopman (Individual PCA)")
+    axes[1].set_xlabel("PC1")
+    axes[1].set_ylabel("PC2")
     axes[1].grid(True)
 
-    plt.suptitle("Latent Trajectories Comparison (Unified PCA Space)")
-    save_path = os.path.join(out_dir, f"unified_pca_{run_id}.png")
+    plt.suptitle("Latent Trajectories Comparison (Separate PCA Spaces)")
+    save_path = os.path.join(out_dir, f"separate_pca_{run_id}.png")
     plt.savefig(save_path)
     print(f"Saved comparison plot: {save_path}")
 

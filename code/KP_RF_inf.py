@@ -26,8 +26,11 @@ def stamp(name):
 # =========================================================
 #  設定：モデルとデータのパス
 # =========================================================
+
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_c.npz')
+
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_203408/model_weights_20251217_203408.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20251218_043045/model_weights_20251218_043045.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -70,7 +73,6 @@ def evaluate_metrics(model, network, device):
     
     # データのロード (Trainと同じ手順)
     # ※パスは環境に合わせて修正してください
-    trip_arrz = np.load('/home/mizutani/projects/RF/data/input_a.npz')
     trip_arr = trip_arrz['route_arr']
     route = torch.from_numpy(trip_arr)
     

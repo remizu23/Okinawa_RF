@@ -19,7 +19,7 @@ import torch.nn.functional as F
 #  設定
 # =========================================================
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_dir = f"/home/mizutani/projects/RF/runs/interpretability_{run_id}"
+out_dir = f"/home/mizutani/projects/RF/runs/interpretability_c_{run_id}"
 os.makedirs(out_dir, exist_ok=True)
 
 def stamp(name):
@@ -27,7 +27,7 @@ def stamp(name):
 
 # 比較したいモデルのパスを指定してください
 # ★ここにそれぞれのモデルパスを入れる
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20251217_184803/model_weights_20251217_184803.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20251218_020243/model_weights_20251218_020243.pth'
 
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -152,7 +152,7 @@ def main():
     print(f"Total routes: {len(all_routes)}")
     
     # ランダムに探索（シード固定）
-    np.random.seed(42)
+    np.random.seed(44)
     shuffled_indices = np.random.permutation(len(all_routes))
     
     target_indices = []
