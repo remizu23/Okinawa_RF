@@ -27,10 +27,10 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_d.npz')
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_e.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_013224/model_weights_20260105_013224.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_170152/model_weights_20260105_170152.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'

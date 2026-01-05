@@ -32,7 +32,7 @@ wandb.config = type("C", (), {
     "savefilename": "model_weights.pth",
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
     "koopman_alpha": 1       # Koopman Lossの重み
 })()
 
@@ -46,7 +46,7 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_d.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_e.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
