@@ -93,7 +93,9 @@ class KoopmanRoutesFormer(nn.Module):
         
         # 4. Koopman Dynamics
         # u_t が「ノード埋め込み(token_emb_dim)」になるため、B行列の入力次元を変更
-        self.A = nn.Parameter(torch.eye(z_dim) + torch.randn(z_dim, z_dim) * 0.01) #単位行列+ノイズ に変更
+
+        # self.A = nn.Parameter(torch.eye(z_dim) + torch.randn(z_dim, z_dim) * 0.01) #単位行列+ノイズ に変更
+        self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
         self.B = nn.Parameter(torch.randn(z_dim, token_emb_dim) * 0.05) 
 
     def forward(self, tokens):
