@@ -10,8 +10,8 @@ from KP_RF import KoopmanRoutesFormer
 # ==========================================
 # 設定: 解析したいモデルのパスを指定してください
 # ==========================================
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_165834/model_weights_20260105_165834.pth'
-graph_filename = '/home/mizutani/projects/RF/runs/20260105_165834/AB.png'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_202734/model_weights_20260105_202734.pth'
+graph_filename = '/home/mizutani/projects/RF/runs/20260105_202734/AB.png'
 # ==========================================
 
 def load_model_for_inspection(model_path):

@@ -214,7 +214,48 @@ class Tokenization:
         ]
 
         return feature_mat
-    
+
+    #滞在カウント埋め込み
+
+    def calculate_stay_counts(self, tokens):
+        """
+        トークン列から滞在カウントテンソルを作成する
+        tokens: [Batch, Seq]
+        return: [Batch, Seq]
+        """
+        batch_size, seq_len = tokens.shape
+        counts = torch.zeros_like(tokens)
+        
+        # 特殊トークンのIDリスト (これらはカウント対象外またはリセット)
+        special_ids = [v for k, v in self.SPECIAL_TOKENS.items()]
+
+        # Pythonループで実装（速度が問題ならC++拡張やNumpyで最適化検討）
+        # PyTorch上での並列化は難しいため、CPU上のTensorまたはListで処理推奨
+        tokens_cpu = tokens.cpu()
+        counts_cpu = torch.zeros_like(tokens_cpu)
+
+        for b in range(batch_size):
+            current_val = -1
+            counter = 0
+            for t in range(seq_len):
+                val = tokens_cpu[b, t].item()
+                
+                # 特殊トークンの場合カウント0
+                if val in special_ids:
+                    counter = 0
+                    current_val = -1
+                    counts_cpu[b, t] = 0
+                    continue
+                
+                if val == current_val:
+                    counter += 1
+                else:
+                    counter = 1
+                    current_val = val
+                
+                counts_cpu[b, t] = counter
+        
+        return counts_cpu.to(self.device)    
 
 '''
     def make_VAE_input(self, token_sequences, time_index, img_dic):

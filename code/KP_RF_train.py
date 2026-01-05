@@ -30,10 +30,15 @@ wandb.config = type("C", (), {
     "eos_weight": 3.0, 
     "stay_weight": 1,
     "savefilename": "model_weights.pth",
+
+    # 0105埋め込み変更後
+    "agent_emb_dim": 16,
+    "stay_emb_dim": 16,
+    "max_stay_count": 100, # 必要に応じて調整
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
-    "koopman_alpha": 1       # Koopman Lossの重み
+    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "koopman_alpha": 0.1       # Koopman Lossの重み
 })()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -65,21 +70,32 @@ network = Network(expanded_adj, expanded_features)
 trip_arr = trip_arrz['route_arr']
 time_arr = trip_arrz['time_arr']
 
+# ★ユーザーIDの読み込み (npzに含まれていると仮定)
+if 'agent_ids' in trip_arrz:
+    agent_ids_arr = trip_arrz['agent_ids']
+else:
+    # なければ仮のID (全員0) を作成、あるいはエラーにする
+    print("Warning: 'agent_ids' not found in npz. Using dummy IDs.")
+    agent_ids_arr = np.zeros(len(trip_arr), dtype=int)
+
+
 route = torch.from_numpy(trip_arr)
 time_pt = torch.from_numpy(time_arr)
-vocab_size = network.N + 4  # 滞在トークン考慮のため
+agent_pt = torch.from_numpy(agent_ids_arr).long() # ★テンソル化
+vocab_size = network.N + 4
 
 
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, data1, data2):
+    def __init__(self, data1, data2, data3):
         self.data1 = data1
         self.data2 = data2
+        self.data3 = data3
     def __len__(self):
         return len(self.data1)
     def __getitem__(self, idx):
-        return self.data1[idx], self.data2[idx]
+        return self.data1[idx], self.data2[idx], self.data3[idx]
 
-dataset = MyDataset(route, time_pt)
+dataset = MyDataset(route, time_pt, agent_pt)
 
 # データ分割 (8:2)
 num_samples = len(dataset)
@@ -92,6 +108,7 @@ val_loader   = DataLoader(val_data,   batch_size=wandb.config.batch_size, shuffl
 
 # --- モデル構築 ---
 d_model = wandb.config.d_ie 
+num_agents = int(agent_pt.max().item()) + 1
 
 model = KoopmanRoutesFormer(
     vocab_size=vocab_size,
@@ -101,7 +118,12 @@ model = KoopmanRoutesFormer(
     num_layers=wandb.config.B_de,
     d_ff=wandb.config.d_ff,
     z_dim=wandb.config.z_dim,
-    pad_token_id=network.N #滞在トークン追加のため
+    pad_token_id=network.N,
+    # ★追加引数
+    num_agents=num_agents,
+    agent_emb_dim=wandb.config.agent_emb_dim,
+    max_stay_count=wandb.config.max_stay_count,
+    stay_emb_dim=wandb.config.stay_emb_dim
 )
 model = model.to(device)
 
@@ -134,14 +156,22 @@ for epoch in range(wandb.config.epochs):
     train_epoch_loss = 0
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
     
-    for batch, _ in pbar:
-        route_batch = batch.to(device)
+    for batch in pbar:
+        # ★batchのunpack (3つ受け取る)
+        route_batch, _, agent_batch = batch 
+        route_batch = route_batch.to(device)
+        agent_batch = agent_batch.to(device)
+        
         tokenizer = Tokenization(network)
         
         input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
         target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
         
-        logits, z_hat, z_pred_next = model(input_tokens)
+        # ★滞在カウントの計算
+        stay_counts = tokenizer.calculate_stay_counts(input_tokens)
+        
+        # ★モデルへの入力 (3つ渡す)
+        logits, z_hat, z_pred_next = model(input_tokens, stay_counts, agent_batch)        
         
         # 1. CE Loss (予測精度)
         loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
@@ -154,6 +184,9 @@ for epoch in range(wandb.config.epochs):
         else:
             loss = loss_ce # Koopman制約なし
         
+
+
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
@@ -167,29 +200,47 @@ for epoch in range(wandb.config.epochs):
     # Validation
     model.eval()
     val_epoch_loss = 0
+
+# --- Validation Loop の修正 ---
+    model.eval()
+    val_loss = 0.0
+
     with torch.no_grad():
-        for batch, _ in val_loader:
-            route_batch = batch.to(device)
+        # ★修正1: 戻り値を3つ受け取る (route, time, agent)
+        for route_batch, _, agent_batch in val_loader:
+            
+            route_batch = route_batch.to(device)
+            agent_batch = agent_batch.to(device) # ★追加
+            
+            # Tokenizerの準備
             tokenizer = Tokenization(network)
             
             input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
             
-            logits, z_hat, z_pred_next = model(input_tokens)
+            # ★追加: 滞在カウントの計算
+            stay_counts = tokenizer.calculate_stay_counts(input_tokens)
+
+            # ★修正2: モデルに3つの引数を渡す
+            logits, z_hat, z_pred_next = model(input_tokens, stay_counts, agent_batch)
+
+            # --- 以下、Loss計算ロジックはTrainと同じ ---
             
+            # 1. Prediction Loss (CrossEntropy)
+            # (reshapeして計算)
             loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
             
-            # Valでも同様に計算
+            # 2. Koopman Loss
             if wandb.config.use_koopman_loss:
-                z_true_next = z_hat[:, 1:, :] 
+                z_true_next = z_hat[:, 1:, :]
                 loss_dyn = criterion_mse(z_pred_next, z_true_next)
                 loss = loss_ce + wandb.config.koopman_alpha * loss_dyn
             else:
                 loss = loss_ce
-            
-            val_epoch_loss += loss.item()
 
-    avg_val_loss = val_epoch_loss / len(val_loader)
+            val_loss += loss.item()
+
+    avg_val_loss = val_loss / len(val_loader)
     history["val_loss"].append(avg_val_loss)
 
     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f} | Val Loss = {avg_val_loss:.4f}")
