@@ -1,7 +1,7 @@
 import torch
 import os
 import glob
-from network import Network
+from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
 from KP_RF import KoopmanRoutesFormer
 from datetime import datetime
@@ -27,10 +27,10 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_c.npz')
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_d.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20251218_043045/model_weights_20251218_043045.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_013224/model_weights_20260105_013224.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -329,8 +329,16 @@ def main():
         return
 
     adj_matrix = torch.load(ADJ_PATH, weights_only=True)
-    dummy_node_features = torch.zeros((len(adj_matrix), 1))
-    network = Network(adj_matrix, dummy_node_features)
+    # 隣接行列の拡張
+    expanded_adj = expand_adjacency_matrix(adj_matrix)
+
+    # 特徴量の作成と拡張
+    dummy_feature_dim = 1
+    dummy_node_features = torch.zeros((len(adj_matrix), dummy_feature_dim))
+    expanded_features = torch.cat([dummy_node_features, dummy_node_features], dim=0)
+
+    # 拡張されたデータでNetworkインスタンスを作成
+    network = Network(expanded_adj, expanded_features)    
     
     # 2. モデルロード
     model_path = MODEL_PATH

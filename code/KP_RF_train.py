@@ -10,7 +10,7 @@ from KP_RF import KoopmanRoutesFormer
 import matplotlib.pyplot as plt
 
 # 自作モジュール
-from network import Network
+from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
 
 # --- 設定周り ---
@@ -32,8 +32,8 @@ wandb.config = type("C", (), {
     "savefilename": "model_weights.pth",
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
-    "koopman_alpha": 0.1       # Koopman Lossの重み
+    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "koopman_alpha": 1       # Koopman Lossの重み
 })()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -46,19 +46,29 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_c.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_d.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
+
+# 滞在トークン用に隣接行列を拡張
+expanded_adj = expand_adjacency_matrix(adj_matrix)
+
 dummy_feature_dim = 1
+# 元の行列サイズでzerosを作る
 dummy_node_features = torch.zeros((len(adj_matrix), dummy_feature_dim))
-network = Network(adj_matrix, dummy_node_features)
+# 縦に結合して倍にする
+expanded_features = torch.cat([dummy_node_features, dummy_node_features], dim=0)
+
+# ★ 拡張された行列と特徴量でNetworkインスタンス化
+network = Network(expanded_adj, expanded_features)
 
 trip_arr = trip_arrz['route_arr']
 time_arr = trip_arrz['time_arr']
 
 route = torch.from_numpy(trip_arr)
 time_pt = torch.from_numpy(time_arr)
-vocab_size = network.N + 4
+vocab_size = network.N + 4  # 滞在トークン考慮のため
+
 
 class MyDataset(torch.utils.data.Dataset):
     def __init__(self, data1, data2):
@@ -91,13 +101,28 @@ model = KoopmanRoutesFormer(
     num_layers=wandb.config.B_de,
     d_ff=wandb.config.d_ff,
     z_dim=wandb.config.z_dim,
-    pad_token_id=network.N
+    pad_token_id=network.N #滞在トークン追加のため
 )
 model = model.to(device)
 
+# # 滞在トークン・移動トークンの初期埋め込みを似せる
+# # トークンID 0~N-1 (移動) の重みを、N~2N-1 (滞在) にコピーする
+# with torch.no_grad():
+#     # Embedding層の重みを取得 [vocab_size, dim]
+#     emb_weight = model.token_embedding.token_embedding.weight
+    
+#     # 0番目からN-1番目までの重みをコピー
+#     original_weights = emb_weight[:network.N]
+    
+#     # N番目から2N-1番目（滞在トークン）に上書き
+#     # 少しだけノイズを加えて「似ているが少し違う」状態からスタートさせる
+#     emb_weight[network.N : network.N*2] = original_weights + torch.randn_like(original_weights) * 0.01
+
+# print("滞在トークンのEmbeddingを移動トークンベースで初期化しました。")
+
 optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
 criterion_mse = nn.MSELoss() 
-ce_loss_fn = nn.CrossEntropyLoss(ignore_index=network.N)
+ce_loss_fn = nn.CrossEntropyLoss(ignore_index=network.N) #滞在トークン追加のため
 
 # --- 学習ループ ---
 print(f"Training Start... (Koopman Loss: {wandb.config.use_koopman_loss})")
