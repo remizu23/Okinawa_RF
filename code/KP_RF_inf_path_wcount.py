@@ -27,14 +27,14 @@ VOCAB_SIZE = 39
 
 # モデルパス (適宜変更してください)
 # ※一方がカウント対応、もう一方が非対応でも動くように作るのが理想です
-MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260105_202734/model_weights_20260105_202734.pth"
-MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260105_203752/model_weights_20260105_203752.pth"
+MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260105_235612/model_weights_20260105_235612.pth"
+MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260105_234558/model_weights_20260105_234558.pth"
 
 # =========================================================
 # 0. 保存先設定
 # =========================================================
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_dir = f"/home/mizutani/projects/RF/runs/comparison_eval_v3_wcount20_{run_id}"
+out_dir = f"/home/mizutani/projects/RF/runs/comparison_eval_v3_wcountLoss_{run_id}"
 os.makedirs(out_dir, exist_ok=True)
 
 print(f"=== Evaluation Started: {run_id} ===")
@@ -320,7 +320,7 @@ def calc_dtw(seq1, seq2):
             dtw[i][j] = cost + min(dtw[i-1][j], dtw[i][j-1], dtw[i-1][j-1])
     return dtw[n][m]
 
-def evaluate_models(model_koopman, model_normal, test_data, prompt_len=20, device='cuda'):
+def evaluate_models(model_koopman, model_normal, test_data, prompt_len=15, device='cuda'):
     results = []
     print(f"Evaluating on {len(test_data)} test trajectories...")
     to_str = lambda seq: "".join([chr(x + 48) for x in seq]) 
@@ -445,7 +445,7 @@ if __name__ == "__main__":
     
     # 3. 評価
     if gt_data:
-        df_res = evaluate_models(model_koopman, model_normal, gt_data, prompt_len=20, device=device)
+        df_res = evaluate_models(model_koopman, model_normal, gt_data, prompt_len=15, device=device)
         
         csv_path = os.path.join(out_dir, "evaluation_results.csv")
         df_res.to_csv(csv_path, index=False)

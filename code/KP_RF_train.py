@@ -20,7 +20,7 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 300, 
+    "epochs": 200, 
     "batch_size": 256,
     "d_ie": 64,
     "head_num": 4, 
@@ -37,8 +37,8 @@ wandb.config = type("C", (), {
     "max_stay_count": 100, # 必要に応じて調整
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
-    "koopman_alpha": 0.1       # Koopman Lossの重み
+    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "koopman_alpha": 1       # Koopman Lossの重み
 })()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,46 +146,89 @@ optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
 criterion_mse = nn.MSELoss() 
 ce_loss_fn = nn.CrossEntropyLoss(ignore_index=network.N) #滞在トークン追加のため
 
-# --- 学習ループ ---
+# =========================================================
+#  学習ループ (Training Phase)
+# =========================================================
 print(f"Training Start... (Koopman Loss: {wandb.config.use_koopman_loss})")
 history = {"train_loss": [], "val_loss": []}
 
 for epoch in range(wandb.config.epochs):
-    # Training
+    # --- Training ---
     model.train()
     train_epoch_loss = 0
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
     
     for batch in pbar:
-        # ★batchのunpack (3つ受け取る)
         route_batch, _, agent_batch = batch 
         route_batch = route_batch.to(device)
         agent_batch = agent_batch.to(device)
         
         tokenizer = Tokenization(network)
-        
         input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
         target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
         
-        # ★滞在カウントの計算
         stay_counts = tokenizer.calculate_stay_counts(input_tokens)
         
-        # ★モデルへの入力 (3つ渡す)
-        logits, z_hat, z_pred_next = model(input_tokens, stay_counts, agent_batch)        
+        # ★修正: 4つの戻り値を受け取る (u_allが必要)
+        logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)        
         
-        # 1. CE Loss (予測精度)
+        # 1. CE Loss (全員共通)
         loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
         
-        # 2. Dynamics Loss (Koopman制約) ★ここをスイッチで切り替え
+        # 初期化
+        loss = loss_ce
+        loss_count = torch.tensor(0.0, device=device)
+        loss_dyn = torch.tensor(0.0, device=device)
+        loss_k = torch.tensor(0.0, device=device)
+
+        # ★ Koopmanモードの時だけ追加Lossを計算
         if wandb.config.use_koopman_loss:
+            
+            # 2. Count Reconstruction (zの意味付け)
+            pred_count = model.count_decoder(z_hat).squeeze(-1)
+            loss_count = criterion_mse(pred_count, stay_counts.float())
+
+            # 3. Multi-step Dynamics Loss (再帰予測)
+            K_steps = 5  # 何歩先まで予測するか
+            
+            # t=0 から t=T-K までの z を初期状態とする
+            current_z = z_hat[:, :-K_steps, :]
+            
+            # 再帰ループ
+            for k in range(K_steps):
+                # 入力 u を取得 (t+k のタイミングのもの)
+                # u_all: [Batch, Seq, Dim]
+                # スライス: t=k から t=Seq-K+k まで
+                end_idx = -K_steps + k if (-K_steps + k) != 0 else None
+                u_curr_step = u_all[:, k : end_idx, :]
+                
+                # 線形遷移: z_{t+1} = A*z_t + B*u_t
+                term_A = torch.einsum("ij,btj->bti", model.A, current_z)
+                term_B = torch.einsum("ij,btj->bti", model.B, u_curr_step)
+                pred_z_next = term_A + term_B
+                
+                # 正解データ (Transformerの出力) と比較
+                start_true = k + 1
+                end_true = -K_steps + k + 1 if (-K_steps + k + 1) != 0 else None
+                true_z_next = z_hat[:, start_true : end_true, :]
+                
+                # 誤差蓄積 (遠い未来ほど係数を小さくしても良い: 0.8^k)
+                decay = 0.8 ** k
+                loss_dyn += criterion_mse(pred_z_next, true_z_next) * decay
+                
+                # ★重要: 自分の予測を次のステップの入力にする
+                current_z = pred_z_next
+
+            # 4. Single-step Loss (念のため直近精度も担保)
             z_true_next = z_hat[:, 1:, :] 
-            loss_dyn = criterion_mse(z_pred_next, z_true_next)
-            loss = loss_ce + wandb.config.koopman_alpha * loss_dyn
-        else:
-            loss = loss_ce # Koopman制約なし
-        
-
-
+            loss_k = criterion_mse(z_pred_next, z_true_next)
+            
+            # 合計Loss
+            # 係数はタスクに応じて調整 (Alphaは重め、Count/Dynは補助的)
+            loss = loss_ce + \
+                   wandb.config.koopman_alpha * loss_k + \
+                   0.1 * loss_count + \
+                   0.1 * loss_dyn
 
         optimizer.zero_grad()
         loss.backward()
@@ -197,50 +240,65 @@ for epoch in range(wandb.config.epochs):
     avg_train_loss = train_epoch_loss / len(train_loader)
     history["train_loss"].append(avg_train_loss)
 
-    # Validation
+    # --- Validation ---
     model.eval()
     val_epoch_loss = 0
-
-# --- Validation Loop の修正 ---
-    model.eval()
-    val_loss = 0.0
-
+    
     with torch.no_grad():
-        # ★修正1: 戻り値を3つ受け取る (route, time, agent)
         for route_batch, _, agent_batch in val_loader:
-            
             route_batch = route_batch.to(device)
-            agent_batch = agent_batch.to(device) # ★追加
+            agent_batch = agent_batch.to(device)
             
-            # Tokenizerの準備
             tokenizer = Tokenization(network)
-            
             input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
-            
-            # ★追加: 滞在カウントの計算
             stay_counts = tokenizer.calculate_stay_counts(input_tokens)
 
-            # ★修正2: モデルに3つの引数を渡す
-            logits, z_hat, z_pred_next = model(input_tokens, stay_counts, agent_batch)
+            # ★修正: 4つの戻り値
+            logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)
 
-            # --- 以下、Loss計算ロジックはTrainと同じ ---
-            
-            # 1. Prediction Loss (CrossEntropy)
-            # (reshapeして計算)
+            # --- Trainと全く同じ分岐ロジック ---
             loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
             
-            # 2. Koopman Loss
+            loss = loss_ce # デフォルト
+            
             if wandb.config.use_koopman_loss:
+                # Count Loss
+                pred_count = model.count_decoder(z_hat).squeeze(-1)
+                loss_count = criterion_mse(pred_count, stay_counts.float())
+
+                # Multi-step Loss
+                loss_dyn = 0
+                K_steps = 5
+                current_z = z_hat[:, :-K_steps, :]
+                
+                for k in range(K_steps):
+                    end_idx = -K_steps + k if (-K_steps + k) != 0 else None
+                    u_curr_step = u_all[:, k : end_idx, :]
+                    
+                    term_A = torch.einsum("ij,btj->bti", model.A, current_z)
+                    term_B = torch.einsum("ij,btj->bti", model.B, u_curr_step)
+                    pred_z_next = term_A + term_B
+                    
+                    start_true = k + 1
+                    end_true = -K_steps + k + 1 if (-K_steps + k + 1) != 0 else None
+                    true_z_next = z_hat[:, start_true : end_true, :]
+                    
+                    loss_dyn += criterion_mse(pred_z_next, true_z_next) * (0.8 ** k)
+                    current_z = pred_z_next # 次へ
+
+                # Single-step
                 z_true_next = z_hat[:, 1:, :]
-                loss_dyn = criterion_mse(z_pred_next, z_true_next)
-                loss = loss_ce + wandb.config.koopman_alpha * loss_dyn
-            else:
-                loss = loss_ce
+                loss_k = criterion_mse(z_pred_next, z_true_next)
+                
+                loss = loss_ce + \
+                       wandb.config.koopman_alpha * loss_k + \
+                       0.1 * loss_count + \
+                       0.1 * loss_dyn
 
-            val_loss += loss.item()
+            val_epoch_loss += loss.item()
 
-    avg_val_loss = val_loss / len(val_loader)
+    avg_val_loss = val_epoch_loss / len(val_loader)
     history["val_loss"].append(avg_val_loss)
 
     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f} | Val Loss = {avg_val_loss:.4f}")

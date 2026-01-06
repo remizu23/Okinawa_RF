@@ -103,6 +103,9 @@ class KoopmanRoutesFormer(nn.Module):
         self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
         self.B = nn.Parameter(torch.randn(z_dim, total_input_dim) * 0.05) 
 
+        # 5. zからの滞在カウント復元強制
+        self.count_decoder = nn.Linear(z_dim, 1)
+
     def forward(self, tokens, stay_counts, agent_ids):
         """
         tokens: [Batch, Seq]
@@ -151,4 +154,4 @@ class KoopmanRoutesFormer(nn.Module):
         )
 
         logits = self.to_logits(z_hat)
-        return logits, z_hat, z_pred_next
+        return logits, z_hat, z_pred_next, u_all
