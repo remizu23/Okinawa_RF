@@ -38,7 +38,7 @@ wandb.config = type("C", (), {
     
     # ★★★ Ablation Study用設定 ★★★
     "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
-    "koopman_alpha": 1       # Koopman Lossの重み
+    "koopman_alpha": 0.1       # Koopman Lossの重み
 })()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -223,12 +223,40 @@ for epoch in range(wandb.config.epochs):
             z_true_next = z_hat[:, 1:, :] 
             loss_k = criterion_mse(z_pred_next, z_true_next)
             
+            # 5. モード損失
+            # 1. まず、すべてを「無視 (-100)」で初期化
+            target_modes = torch.full_like(target_tokens, -100)  # target_modes: [Batch, Seq]
+
+            # 2. Moveトークン (0 <= ID < 19) の場所を "1" に設定
+            is_move = (target_tokens >= 0) & (target_tokens < network.N)
+            target_modes[is_move] = 1
+
+            # 3. Stayトークン (19 <= ID < 38) の場所を "0" に設定
+            # STAY_OFFSET = 19, PAD_TOKEN = 38 (network.N * 2)
+            STAY_OFFSET = network.N
+            PAD_TOKEN = network.N * 2
+            is_stay = (target_tokens >= STAY_OFFSET) & (target_tokens < PAD_TOKEN)
+            target_modes[is_stay] = 0
+
+            # --- Loss計算 ---
+            # model.mode_classifier(z_hat) -> [Batch, Seq, 2]
+            pred_modes = model.mode_classifier(z_hat)
+
+            # 形状を合わせる: [Batch*Seq, 2] vs [Batch*Seq]
+            # ignore_index=-100 なので、パディング部分は自動的に無視され、
+            # Move(1)とStay(0)の部分だけが学習されます。
+            loss_mode = nn.CrossEntropyLoss(ignore_index=-100)(
+                pred_modes.view(-1, 2), 
+                target_modes.view(-1)
+            )
+
             # 合計Loss
             # 係数はタスクに応じて調整 (Alphaは重め、Count/Dynは補助的)
             loss = loss_ce + \
                    wandb.config.koopman_alpha * loss_k + \
                    0.1 * loss_count + \
-                   0.1 * loss_dyn
+                   0.1 * loss_dyn + \
+                   0.1 * loss_mode
 
         optimizer.zero_grad()
         loss.backward()
@@ -290,11 +318,30 @@ for epoch in range(wandb.config.epochs):
                 # Single-step
                 z_true_next = z_hat[:, 1:, :]
                 loss_k = criterion_mse(z_pred_next, z_true_next)
-                
+            
+                # 5. モード損失
+                target_modes = torch.full_like(target_tokens, -100)  # target_modes: [Batch, Seq]
+
+                is_move = (target_tokens >= 0) & (target_tokens < network.N)
+                target_modes[is_move] = 1
+
+                STAY_OFFSET = network.N
+                PAD_TOKEN = network.N * 2
+                is_stay = (target_tokens >= STAY_OFFSET) & (target_tokens < PAD_TOKEN)
+                target_modes[is_stay] = 0
+
+                pred_modes = model.mode_classifier(z_hat)
+                loss_mode = nn.CrossEntropyLoss(ignore_index=-100)(
+                    pred_modes.view(-1, 2), 
+                    target_modes.view(-1)
+                )
+
                 loss = loss_ce + \
                        wandb.config.koopman_alpha * loss_k + \
                        0.1 * loss_count + \
-                       0.1 * loss_dyn
+                       0.1 * loss_dyn + \
+                       0.1 * loss_mode
+
 
             val_epoch_loss += loss.item()
 

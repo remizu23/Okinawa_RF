@@ -30,7 +30,7 @@ def stamp(name):
 trip_arrz = np.load('/home/mizutani/projects/RF/data/input_e.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_235612/model_weights_20260105_235612.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260107_124130/model_weights_20260107_124130.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -335,6 +335,111 @@ def visualize_trajectory_3d(z_history_list, routes_list, start_nodes, title="Tra
     plt.close()
     print(f"Saved 3D plots to: {out_dir}")
 
+# 固定点図
+def analyze_stability_and_dynamics(model, network, device):
+    """
+    線形システムの安定性解析と、ノードごとの力学特性を可視化する
+    """
+    print("\n=== Linear System Analysis ===")
+    
+    # 1. 固有値解析 (Eigenvalue Analysis)
+    A_np = model.A.detach().cpu().numpy()
+    eigenvalues, eigenvectors = np.linalg.eig(A_np)
+    
+    # 絶対値（大きさ）を確認
+    abs_eig = np.abs(eigenvalues)
+    max_eig = np.max(abs_eig)
+    
+    print(f"Max Eigenvalue |λ|: {max_eig:.4f}")
+    if max_eig > 1.0:
+        print("-> System is UNSTABLE (Explodes over time)")
+    elif max_eig > 0.99:
+        print("-> System is MARGINALLY STABLE (Good for memory/cycles)")
+    else:
+        print("-> System is STABLE (Decays to zero, forgets quickly)")
+
+    # プロット: 単位円と固有値
+    # plt.figure(figsize=(6, 6))
+    # theta = np.linspace(0, 2*np.pi, 100)
+    # plt.plot(np.cos(theta), np.sin(theta), 'k--', alpha=0.3, label='Unit Circle')
+    # plt.scatter(eigenvalues.real, eigenvalues.imag, c='red', marker='x', label='Eigenvalues')
+    # plt.axhline(0, color='gray', lw=0.5)
+    # plt.axvline(0, color='gray', lw=0.5)
+    # plt.title(f"Stability Analysis (Max |λ|={max_eig:.3f})")
+    # plt.xlabel("Real Part")
+    # plt.ylabel("Imaginary Part")
+    # plt.legend()
+    # plt.grid(True)
+    # plt.axis('equal')
+    # plt.savefig(stamp("analysis_eigenvalues.png"))
+    # plt.close()
+    
+    # 2. 固定点解析 (Fixed Point Analysis)
+    # z_{t+1} = A z_t + B u_t において、z_{t+1} = z_t となる点 z* を探す
+    # z* = (I - A)^(-1) B u
+    # これが「そのノードにずっと留まろうとする時の重心位置」
+    
+    I = np.eye(A_np.shape[0])
+    try:
+        # (I - A) の逆行列
+        Inv_I_minus_A = np.linalg.inv(I - A_np)
+        has_inverse = True
+    except np.linalg.LinAlgError:
+        print("Matrix (I-A) is singular. System has purely integral components.")
+        has_inverse = False
+
+    if has_inverse:
+        B_np = model.B.detach().cpu().numpy()
+        
+        # 各ノードの埋め込み u を取得 (滞在カウント0の状態)
+        # Agent IDなどはとりあえず0番で固定
+        tokenizer = Tokenization(network)
+        node_indices = torch.arange(network.N).to(device) # 全ノード
+        dummy_counts = torch.zeros_like(node_indices).to(device)
+        dummy_agents = torch.zeros(network.N, dtype=torch.long).to(device)
+        
+        # モデルから u_all を取得するため、一度forwardを回す必要があるが、
+        # ここでは内部構造を知っているので手動で埋め込み作成
+        with torch.no_grad():
+            token_vec = model.token_embedding(node_indices)
+            stay_vec = model.stay_embedding(dummy_counts)
+            agent_vec = model.agent_embedding(dummy_agents).unsqueeze(1) # shape合わせが必要かも
+            # 簡易的にtoken_vecだけでBとの積を見る (uの主成分はtokenなので)
+            # 正確には結合が必要ですが、傾向を見るにはこれでもOK
+            
+            # B行列の形状に合わせて入力作成 (B: z_dim x input_dim)
+            # ここでは簡単のため、input_dim全体を取得するのは手間なので
+            # "入力 u によって z がどう動かされるか (B u)" だけを計算
+            
+            # KP_RF.pyのforwardを参考に u_all を作る
+            u_all = torch.cat([token_vec, stay_vec, model.agent_embedding(dummy_agents)], dim=-1)
+            u_np = u_all.cpu().numpy() # [N, input_dim]
+            
+            # 各ノードの固定点 z* = (I-A)^(-1) * B * u
+            # B: [z_dim, u_dim], u: [N, u_dim] -> B u.T : [z_dim, N]
+            forcing = B_np @ u_np.T 
+            fixed_points = Inv_I_minus_A @ forcing # [z_dim, N]
+            fixed_points = fixed_points.T # [N, z_dim]
+            
+            # PCAで可視化
+            pca = PCA(n_components=2)
+            z_2d = pca.fit_transform(fixed_points)
+            
+            plt.figure(figsize=(10, 8))
+            plt.scatter(z_2d[:, 0], z_2d[:, 1], c='blue', s=100, alpha=0.6)
+            
+            for i in range(network.N):
+                plt.text(z_2d[i, 0], z_2d[i, 1], str(i), fontsize=12, fontweight='bold')
+                
+            plt.title("Attractors (Fixed Points) of Each Node in Latent Space")
+            plt.xlabel("PC1")
+            plt.ylabel("PC2")
+            plt.grid(True)
+            plt.savefig(stamp("fixed_points.png"))
+            plt.close()
+            print("Saved fixed points analysis.")
+
+
 def main():
     if not os.path.exists(ADJ_PATH):
         print(f"Error: Adjacency matrix not found at {ADJ_PATH}")
@@ -374,6 +479,8 @@ def main():
         f.write("============================\n")
 
     analyze_eigenvalues(model)
+
+    analyze_stability_and_dynamics(model, network, device)
     
     all_z_histories = []
     all_routes = []

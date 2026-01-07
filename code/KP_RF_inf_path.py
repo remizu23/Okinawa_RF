@@ -25,7 +25,7 @@ STAY_OFFSET = 19
 VOCAB_SIZE = 39 # 0-18(Move) + 19-37(Stay) + 38(Pad)
 
 # モデルパス (適宜変更してください)
-MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260105_164148/model_weights_20260105_164148.pth"
+MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260106_184139/model_weights_20260106_184139.pth"
 MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260105_164632/model_weights_20260105_164632.pth"
 
 # =========================================================

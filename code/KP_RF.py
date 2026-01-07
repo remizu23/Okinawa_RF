@@ -106,6 +106,9 @@ class KoopmanRoutesFormer(nn.Module):
         # 5. zからの滞在カウント復元強制
         self.count_decoder = nn.Linear(z_dim, 1)
 
+        # 6. zからの移動/滞在
+        self.mode_classifier = nn.Linear(z_dim, 2) # [Stay, Move]の2値分類
+
     def forward(self, tokens, stay_counts, agent_ids):
         """
         tokens: [Batch, Seq]

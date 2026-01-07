@@ -27,14 +27,14 @@ VOCAB_SIZE = 39
 
 # モデルパス (適宜変更してください)
 # ※一方がカウント対応、もう一方が非対応でも動くように作るのが理想です
-MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260105_235612/model_weights_20260105_235612.pth"
+MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260107_124130/model_weights_20260107_124130.pth"
 MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260105_234558/model_weights_20260105_234558.pth"
 
 # =========================================================
 # 0. 保存先設定
 # =========================================================
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_dir = f"/home/mizutani/projects/RF/runs/comparison_eval_v3_wcountLoss_{run_id}"
+out_dir = f"/home/mizutani/projects/RF/runs/comparison_eval_v3_simpleLoss_{run_id}"
 os.makedirs(out_dir, exist_ok=True)
 
 print(f"=== Evaluation Started: {run_id} ===")
@@ -229,7 +229,16 @@ def load_model(model_path, device):
     # モデルがAgentID対応かどうかを判定するためのフラグを仕込んでおく
     model.has_extra_inputs = ('agent_emb_dim' in config) or (hasattr(model, 'agent_embedding'))
 
-    model.load_state_dict(checkpoint['model_state_dict'])
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        # 念のため、足りなかったキーを表示して確認できるようにする
+        missing_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False).missing_keys
+        if missing_keys:
+            print(f"Warning: Missing keys in state_dict (Safe to ignore if these are new layers): {missing_keys}")
+    except RuntimeError as e:
+        # strict=Falseでもサイズ不一致などで落ちる場合は報告
+        save_log(f"Critical Error in load_state_dict: {e}")
+        raise e    
     model.to(device)
     model.eval()
     return model, config
