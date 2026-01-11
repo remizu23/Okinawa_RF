@@ -370,9 +370,9 @@ for epoch in range(wandb.config.epochs):
             # 係数はタスクに応じて調整 (Alphaは重め、Count/Dynは補助的)
             loss = loss_ce + \
                    wandb.config.koopman_alpha * loss_k + \
-                   0.001 * loss_count + \
                    0.1 * loss_dyn
                 #    0.1 * loss_mode
+                #    0.001 * loss_count + \
 
         optimizer.zero_grad()
         loss.backward()
@@ -447,9 +447,9 @@ for epoch in range(wandb.config.epochs):
 
                 loss = loss_ce + \
                        wandb.config.koopman_alpha * loss_k + \
-                       0.001 * loss_count + \
                        0.1 * loss_dyn
                     #    0.1 * loss_mode
+                    #    0.001 * loss_count + \
 
             val_epoch_loss += loss.item()
 

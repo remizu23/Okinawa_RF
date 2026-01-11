@@ -65,7 +65,7 @@ class KoopmanRoutesFormer(nn.Module):
         # ★追加引数
         num_agents=1,        # 全エージェント数 (IDの最大値+1)
         agent_emb_dim=16,    # エージェントIDの埋め込み次元
-        max_stay_count=100,  # 滞在カウントの最大値
+        max_stay_count=500,  # 滞在カウントの最大値
         stay_emb_dim=16      # 滞在カウントの埋め込み次元
     ):
         super().__init__()

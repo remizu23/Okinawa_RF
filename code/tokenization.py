@@ -19,113 +19,80 @@ class Tokenization:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         #self.to(self.device)
 
-    def tokenization(self, route,  mode, lmax = None):
+    def tokenization(self, route, mode):
+        """
+        route: [Batch, Seq] (固定長, 右側パディング済み)
+        """
         self.route = route
-        #もとのinputデータにもpaddingは入っている
-        num_data = len(self.route)
-        adjacency_matrix = self.network.adj_matrix.to(self.device)
-        # 特殊トークンの定義
-        tokens = self.route.clone().to(self.device) 
+        batch_size, seq_len = route.shape
+        tokens = route.clone().to(self.device)
+        
+        # 入力データのパディングマスク (38の部分がTrue)
+        # ※前提: 入力データにおいてパディングは '38' または '0' などで埋められている
+        # ここではnetwork.N (38) がパディングIDと仮定
+        is_padding = (tokens == self.SPECIAL_TOKENS["<p>"])
 
-        # モードに応じたトークン化処理
+        # パディング用の列を作成
+        pad_col = torch.full((batch_size, 1), self.SPECIAL_TOKENS["<p>"], device=self.device)
+
         if mode == "simple":
-            ##前と後ろにパディングトークンをくっつける
-            new_column = torch.full((num_data, 1), self.SPECIAL_TOKENS["<p>"], device=self.device) 
-            tokens = torch.cat((new_column, tokens, new_column), dim=1)
-            #前の塊の中で最初に出てくるパディングトークンを開始トークンにおきかえる
-            mask = tokens == self.SPECIAL_TOKENS["<p>"]
-
-            # 各行の左端から最初に現れる非パディングトークンの位置を取得
-            first_non_padding_indices = (~mask).float().argmax(dim=1)
-            # 最初の <p> の塊の最後のインデックスを計算
-            last_padding_in_head_indices = first_non_padding_indices - 1
-            # 対応するトークンを開始トークンに置き換え
-            tokens[torch.arange(tokens.size(0)), last_padding_in_head_indices] = self.SPECIAL_TOKENS["<b>"]
-
-        elif mode == "complete":
-            new_column = torch.full((num_data, 1), self.SPECIAL_TOKENS["<p>"], device=self.device) 
-            tokens = torch.cat((new_column, tokens, new_column), dim=1)
-
-            #前の塊の中で最初に出てくるパディングトークンを開始トークンにおきかえる
-            mask = tokens == self.SPECIAL_TOKENS["<p>"]
-            # 各行の左端から最初に現れる非パディングトークンの位置を取得
-            first_non_padding_indices = (~mask).float().argmax(dim=1)
-            # 最初の <p> の塊の最後のインデックスを計算
-            last_padding_in_head_indices = first_non_padding_indices - 1
-            # 対応するトークンを開始トークンに置き換え
-            tokens[torch.arange(tokens.size(0)), last_padding_in_head_indices] = self.SPECIAL_TOKENS["<b>"]
-
-            seq_len = tokens.size(1)
-            last_non_padding_indices = seq_len - 1 - (~mask).float().flip(dims=[1]).argmax(dim=1)
-            first_padding_in_tail_indices = last_non_padding_indices + 1
-            tokens[torch.arange(tokens.size(0)), first_padding_in_tail_indices] = self.SPECIAL_TOKENS["<e>"]
-            tokens = tokens[:, 1:]
-            tokens = torch.cat((tokens, new_column), dim=1)
-
+            # 入力: [start, ..., end, pad, pad]
+            # 出力: [<b>, start, ..., end, pad, pad] (長さは+1されるが、末尾のpadを一つ消して長さを保つか、伸ばすか)
+            # ここではシンプルに「頭に<b>をつける」処理にする
+            
+            # 1. 左にPadカラムを追加
+            tokens = torch.cat((pad_col, tokens), dim=1) # [Batch, Seq+1]
+            
+            # 2. 先頭(index 0)を <b> に変える
+            # 元データが左詰めなら、これで [<b>, node1, node2, ..., pad] になる
+            tokens[:, 0] = self.SPECIAL_TOKENS["<b>"]
+            
+            # ※もし元データ自体にパディングがなくフルに入っている場合、系列長が1増える
+            # 学習時はこれでも問題ない
 
         elif mode == "next":
-            ##前と後ろにパディングトークンをくっつける
-            new_column = torch.full((num_data, 1), self.SPECIAL_TOKENS["<p>"], device=self.device) 
-            tokens = torch.cat((new_column, tokens, new_column), dim=1)
-            #後ろの塊の中で最初に出てくるパディングトークンを終了トークンにおきかえる
-            mask = tokens == self.SPECIAL_TOKENS["<p>"]
-            seq_len = tokens.size(1)
-            last_non_padding_indices = seq_len - 1 - (~mask).float().flip(dims=[1]).argmax(dim=1)
-            first_padding_in_tail_indices = last_non_padding_indices + 1
-            tokens[torch.arange(tokens.size(0)), first_padding_in_tail_indices] = self.SPECIAL_TOKENS["<e>"]
-            tokens = tokens[:, 1:]
-            tokens = torch.cat((tokens, new_column), dim=1)
+            # 入力: [start, ..., end, pad, pad]
+            # 出力: [start, ..., end, <e>, pad] (右にずらして<e>を入れる)
+            
+            # 1. 右にPadカラムを追加
+            tokens = torch.cat((tokens, pad_col), dim=1) # [Batch, Seq+1]
+            
+            # 2. 有効データの末尾の「次」に <e> を入れる
+            # is_padding: [Batch, Seq]
+            # 各行で「最初のパディング位置」を探す
+            # パディングがない場合は seq_len の位置
+            
+            # 論理反転して、右から累積和をとるなどの方法もあるが、
+            # シンプルに「パディングでないものの個数」をカウントしてインデックスにする
+            valid_lengths = (~is_padding).sum(dim=1) # [Batch]
+            
+            # <e> を挿入する位置
+            eos_indices = valid_lengths
+            
+            # scatter_ で <e> を埋め込む
+            # tokens: [Batch, Seq+1]
+            # dim=1 の eos_indices の位置に <e> を入れる
+            tokens.scatter_(1, eos_indices.unsqueeze(1), self.SPECIAL_TOKENS["<e>"])
+            
+            # 3. simpleモードと長さを合わせるために先頭を削るかどうか？
+            # TransformerのTeacher Forcingでは:
+            # Input: [<b>, A, B, C]
+            # Target: [A, B, C, <e>]
+            # というペアを作るのが一般的。
+            # 上記simpleモードは [<b>, A, B, C, pad] (長さSeq+1)
+            # このnextモードは [A, B, C, <e>, pad] (長さSeq+1) になっているはず
+            # ただし、元tokensの先頭がAなので、そのまま使うとずれない。
+            
+            # inputとtargetで系列長を合わせる必要があるため、
+            # simple: cat(pad, tokens) -> set 0 to <b>
+            # next:   cat(tokens, pad) -> set tail to <e>
+            # これで長さは共に Seq+1 になる。
+            
+            pass # 処理完了
 
-        elif mode == "discontinuous":
-            ##前と後ろにパディングトークンをくっつける
-            new_column = torch.full((num_data, 1), self.SPECIAL_TOKENS["<p>"], device=self.device) 
-            tokens = torch.cat((new_column, tokens, new_column), dim=1)
-
-            # 各行の左端から最初に現れる非パディングトークンの位置を取得
-            mask = tokens == self.SPECIAL_TOKENS["<p>"]
-            first_non_padding_indices = (~mask).float().argmax(dim=1)
-            # 最初の <p> の塊の最後のインデックスを計算
-            last_padding_in_head_indices = first_non_padding_indices - 1
-            # 対応するトークンを開始トークンに置き換え
-            batch_indices = torch.arange(tokens.size(0), device=tokens.device)
-            tokens[batch_indices, last_padding_in_head_indices] = self.SPECIAL_TOKENS["<b>"]
-
-            #パディングではない最後のトークンを取得
-            seq_len = tokens.size(1)  # トークン列の長さ
-            last_non_padding_indices = seq_len - 1 - (~mask).float().flip(dims=[1]).argmax(dim=1)
-
-            #last_non_padding_indices = (~mask).float().flip(dims=[1]).argmax(dim=1)
-            non_padding_values = tokens[batch_indices, last_non_padding_indices]
-
-            #開始トークンの2つ先を<m>に置き換える
-            tokens[batch_indices, last_padding_in_head_indices + 2] = self.SPECIAL_TOKENS["<m>"]
-            #もし，last_padding_in_head_indicesとlast_non_padding_indicesの差が2のとき，last_padding_in_head_indicesの該当する行の値を-1する(もし検出されたのが出発地と到着地の2ノードでかつそれが最後の時エラーになるため)
-            diff = last_non_padding_indices - last_padding_in_head_indices
-            adjust_mask = diff == 2
-            last_padding_in_head_indices[adjust_mask] -= 1
-            #開始トークンの3つ先を最後のトークンに置き換える
-            tokens[batch_indices, last_padding_in_head_indices + 3] = non_padding_values
-            #開始トークンの4つ先を最後のトークンに置き換える
-            tokens[batch_indices, last_padding_in_head_indices + 4] = self.SPECIAL_TOKENS["<e>"]
-            #5つ先以降はパディングトークンに置き換える
-            batch_size, seq_len = tokens.size()
-            replace_mask = torch.arange(seq_len, device=tokens.device).unsqueeze(0) >= (last_padding_in_head_indices + 5).unsqueeze(1)
-            tokens[replace_mask] = self.SPECIAL_TOKENS["<p>"]
-            #print(tokens[0, :])
-            #print(last_non_padding_indices[0])
+        return tokens.long()
 
 
-
-        elif mode == "traveled":
-            new_column = torch.full((num_data, 1), self.SPECIAL_TOKENS["<b>"], device=self.device) 
-            tokens = torch.cat((new_column, tokens), dim=1)
-
-        else:
-            raise ValueError(f"Unknown mode '{mode}'.")
-
-        # リストをPyTorchテンソルに変換
-        return tokens.clone().detach().to(torch.long)
-    
     def mask(self, mask_rate):
         mask_token_id = self.SPECIAL_TOKENS["<m>"]
         token_sequences = self.route.clone().to(self.device)
@@ -219,20 +186,14 @@ class Tokenization:
 
     def calculate_stay_counts(self, tokens):
         """
-        トークン列から滞在カウントテンソルを作成する
-        tokens: [Batch, Seq]
-        return: [Batch, Seq]
+        トークン列から滞在カウントテンソルを作成する (CPU処理版)
         """
         batch_size, seq_len = tokens.shape
-        counts = torch.zeros_like(tokens)
-        
-        # 特殊トークンのIDリスト (これらはカウント対象外またはリセット)
-        special_ids = [v for k, v in self.SPECIAL_TOKENS.items()]
-
-        # Pythonループで実装（速度が問題ならC++拡張やNumpyで最適化検討）
-        # PyTorch上での並列化は難しいため、CPU上のTensorまたはListで処理推奨
+        # CPUで計算してGPUに戻す
         tokens_cpu = tokens.cpu()
         counts_cpu = torch.zeros_like(tokens_cpu)
+        
+        special_ids = [v for k, v in self.SPECIAL_TOKENS.items()]
 
         for b in range(batch_size):
             current_val = -1
@@ -240,7 +201,7 @@ class Tokenization:
             for t in range(seq_len):
                 val = tokens_cpu[b, t].item()
                 
-                # 特殊トークンの場合カウント0
+                # 特殊トークンはカウント0
                 if val in special_ids:
                     counter = 0
                     current_val = -1
@@ -255,7 +216,7 @@ class Tokenization:
                 
                 counts_cpu[b, t] = counter
         
-        return counts_cpu.to(self.device)    
+        return counts_cpu.to(self.device)
 
 '''
     def make_VAE_input(self, token_sequences, time_index, img_dic):

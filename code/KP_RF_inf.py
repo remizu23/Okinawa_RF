@@ -27,10 +27,10 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_e.npz')
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260107_124130/model_weights_20260107_124130.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260111_173552/model_weights_20260111_173552.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -166,7 +166,7 @@ def load_model(model_path, network):
         pad_token_id=config['pad_token_id'],
         num_agents=config.get('num_agents', 1),
         agent_emb_dim=config.get('agent_emb_dim', 16),
-        max_stay_count=config.get('max_stay_count', 100),
+        max_stay_count=config.get('max_stay_count', 500),
         stay_emb_dim=config.get('stay_emb_dim', 16)
     )
     
