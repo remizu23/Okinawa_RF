@@ -20,7 +20,7 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 300, 
+    "epochs": 1000, # EarlyStoppingが入るので大きめに設定
     "batch_size": 128, # 系列が長くなるので、メモリ溢れするならここを減らす
     "d_ie": 64,
     "head_num": 4, 
@@ -232,6 +232,20 @@ def masked_mse_loss(input, target, mask):
 # CE Lossは ignore_index でパディング(network.N)を無視
 ce_loss_fn = nn.CrossEntropyLoss(ignore_index=network.N)
 
+# =========================================================
+#  ★ Early Stopping の準備
+# =========================================================
+patience = 15
+early_stopping_counter = 0
+best_val_loss = float('inf')
+
+# ベストモデルと最終モデルの保存名
+final_savefilename = stamp(wandb.config.savefilename.replace(".pth", f"_final_{run_id}.pth"))
+best_savefilename  = stamp(wandb.config.savefilename.replace(".pth", f"_best_{run_id}.pth"))
+
+print(f"Training Start... (Koopman Loss: {wandb.config.use_koopman_loss})")
+history = {"train_loss": [], "val_loss": []}
+
 
 # =========================================================
 #  学習ループ (Training Phase)
@@ -256,26 +270,6 @@ for epoch in range(wandb.config.epochs):
         
         stay_counts = tokenizer.calculate_stay_counts(input_tokens)
         
-        # === ★デバッグ用コード追加開始 ===
-        # モデルが許容する最大値
-        max_vocab = model.token_embedding.num_embeddings
-        max_stay = model.stay_embedding.num_embeddings
-        max_agent = model.agent_embedding.num_embeddings
-
-        # 入力データの最大値
-        curr_token_max = input_tokens.max().item()
-        curr_stay_max = stay_counts.max().item()
-        curr_agent_max = agent_batch.max().item()
-
-        # チェック
-        if curr_token_max >= max_vocab:
-            print(f"【エラー原因】トークンID超過: 入力{curr_token_max} >= 許容{max_vocab}")
-        if curr_stay_max >= max_stay:
-            print(f"【エラー原因】滞在カウント超過: 入力{curr_stay_max} >= 許容{max_stay}")
-        if curr_agent_max >= max_agent:
-            print(f"【エラー原因】Agent ID超過: 入力{curr_agent_max} >= 許容{max_agent}")
-        # === ★デバッグ用コード追加終了 ===
-
         # ★修正: 4つの戻り値を受け取る (u_allが必要)
         logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)        
         
@@ -297,6 +291,8 @@ for epoch in range(wandb.config.epochs):
 
             # 2. Count Reconstruction (zの意味付け)
             pred_count = model.count_decoder(z_hat).squeeze(-1)
+            
+            # ★カウント予測をやめる場合はここをコメントアウトし、loss_count=0のままにする
             loss_count = masked_mse_loss(pred_count, stay_counts.float(), valid_mask)
 
             # 3. Multi-step Dynamics Loss (再帰予測)
@@ -459,10 +455,51 @@ for epoch in range(wandb.config.epochs):
     print(f"Epoch {epoch+1}: Train Loss = {avg_train_loss:.4f} | Val Loss = {avg_val_loss:.4f}")
 
 
-# --- 保存処理 ---
-savefilename = stamp(wandb.config.savefilename.replace(".pth", f"_{run_id}.pth"))
+# =========================================================
+    # ★ Early Stopping & Best Model Saving Logic (C案)
+    # =========================================================
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        early_stopping_counter = 0
+        print(f"--> Best Model Found! Val Loss: {best_val_loss:.4f}. Saving...")
+        
+        # ベストモデルの保存
+        save_data = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "config": {
+                "vocab_size": vocab_size,
+                "token_emb_dim": wandb.config.d_ie,
+                "d_model": d_model,
+                "nhead": wandb.config.head_num,
+                "num_layers": wandb.config.B_de,
+                "d_ff": wandb.config.d_ff,
+                "z_dim": wandb.config.z_dim,
+                "pad_token_id": network.N,
+                "num_agents": num_agents,
+                "agent_emb_dim": wandb.config.agent_emb_dim,
+                "max_stay_count": wandb.config.max_stay_count,
+                "stay_emb_dim": wandb.config.stay_emb_dim,
+                "use_koopman_loss": wandb.config.use_koopman_loss,
+                "koopman_alpha": wandb.config.koopman_alpha
+            },
+            "history": history,
+            "best_val_loss": best_val_loss,
+            "epoch": epoch
+        }
+        torch.save(save_data, best_savefilename)
+    else:
+        early_stopping_counter += 1
+        print(f"--> No Improvement. Counter: {early_stopping_counter}/{patience}")
+        
+        if early_stopping_counter >= patience:
+            print("Early Stopping Triggered. Stopping Training.")
+            break
 
-save_data = {
+# =========================================================
+#  最終モデルの保存 (ループ終了後)
+# =========================================================
+save_data_final = {
     "model_state_dict": model.state_dict(),
     "optimizer_state_dict": optimizer.state_dict(),
     "config": {
@@ -474,17 +511,18 @@ save_data = {
         "d_ff": wandb.config.d_ff,
         "z_dim": wandb.config.z_dim,
         "pad_token_id": network.N,
-        # Ablation設定も保存
+        "num_agents": num_agents,
+        "agent_emb_dim": wandb.config.agent_emb_dim,
+        "max_stay_count": wandb.config.max_stay_count,
+        "stay_emb_dim": wandb.config.stay_emb_dim,
         "use_koopman_loss": wandb.config.use_koopman_loss,
         "koopman_alpha": wandb.config.koopman_alpha
     },
-    "history": history,
-    "train_indices": train_data.indices,
-    "val_indices": val_data.indices
+    "history": history
 }
-
-torch.save(save_data, savefilename)
-print(f"Model weights saved successfully at: {savefilename}")
+torch.save(save_data_final, final_savefilename)
+print(f"Final Model saved: {final_savefilename}")
+print(f"Best Model saved at: {best_savefilename}")
 
 # --- グラフ描画 ---
 try:
