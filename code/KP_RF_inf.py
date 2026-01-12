@@ -30,7 +30,7 @@ def stamp(name):
 trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260111_200333/model_weights_best_20260111_200333.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260111_173552/model_weights_20260111_173552.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'

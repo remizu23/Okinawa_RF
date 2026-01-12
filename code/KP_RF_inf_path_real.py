@@ -30,8 +30,8 @@ VOCAB_SIZE = 39
 REAL_DATA_PATH = "/home/mizutani/projects/RF/data/input_real_test.npz"
 
 # モデルパス
-MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260111_200333/model_weights_best_20260111_200333.pth"
-MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260111_190040/model_weights_best_20260111_190040.pth"
+MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260111_173552/model_weights_20260111_173552.pth"
+MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260111_020209/model_weights_20260111_020209.pth"
 
 
 # =========================================================
