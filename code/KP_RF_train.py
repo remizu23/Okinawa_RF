@@ -20,7 +20,7 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 300, 
+    "epochs": 500, 
     "batch_size": 128, # 系列が長くなるので、メモリ溢れするならここを減らす
     "d_ie": 64,
     "head_num": 4, 

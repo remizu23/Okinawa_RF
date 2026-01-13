@@ -27,10 +27,10 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real.npz')
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_e.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260111_173552/model_weights_20260111_173552.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260105_233311_Aa_synth/model_weights_20260105_233311.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -155,6 +155,18 @@ def load_model(model_path, network):
     use_koopman = config.get('use_koopman_loss', 'Unknown')
     print(f"Model Config - Use Koopman: {use_koopman}")
 
+    # ★修正1: 昔のモデル(100)か今のモデル(500)かを、チェックポイント内の重み形状から自動判定するロジック
+    # configに正しく保存されていない場合もあるため、念のためstate_dictを見る
+    state_dict = checkpoint['model_state_dict']
+    if 'stay_embedding.weight' in state_dict:
+        # 形状を取得 (例: [101, 16] or [501, 16])
+        num_embeddings = state_dict['stay_embedding.weight'].shape[0]
+        actual_max_stay_count = num_embeddings - 1
+        print(f"Detected max_stay_count from weights: {actual_max_stay_count}")
+    else:
+        # なければconfigを信じる、あるいはデフォルト
+        actual_max_stay_count = config.get('max_stay_count', 100)
+
     model = KoopmanRoutesFormer(
         vocab_size=config['vocab_size'],
         token_emb_dim=config['token_emb_dim'],
@@ -166,11 +178,19 @@ def load_model(model_path, network):
         pad_token_id=config['pad_token_id'],
         num_agents=config.get('num_agents', 1),
         agent_emb_dim=config.get('agent_emb_dim', 16),
-        max_stay_count=config.get('max_stay_count', 500),
+        # ★ここで検出した値を適用
+        max_stay_count=actual_max_stay_count, 
         stay_emb_dim=config.get('stay_emb_dim', 16)
     )
     
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # ★修正2: mode_classifierなどが無くてもエラーにしない (strict=False)
+    # これにより、昔のモデルに無かった層は「初期化されたまま（ランダムな値）」になりますが、
+    # 推論やzの分析をする分には、その層を使わなければ問題ありません。
+    missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+    
+    if missing_keys:
+        print(f"Warning: Missing keys in checkpoint (OK for legacy models): {missing_keys}")
+    
     model.to(device)
     model.eval()
     
@@ -439,6 +459,142 @@ def analyze_stability_and_dynamics(model, network, device):
             plt.close()
             print("Saved fixed points analysis.")
 
+def visualize_z_all_dimensions(z_history_list, routes_list, start_nodes, run_id):
+    """
+    潜在変数 z (16次元) の全次元の時系列変化を可視化する
+    1. ヒートマップ (全体俯瞰)
+    2. 多段ラインプロット (詳細)
+    """
+    import seaborn as sns
+    
+    # 全サンプル可視化
+    num_samples_to_plot = min(len(z_history_list), 8)
+    
+    for i in range(num_samples_to_plot):
+        z_seq = np.array(z_history_list[i]) # [SeqLen, z_dim]
+        route = routes_list[i]
+        seq_len, z_dim = z_seq.shape
+        
+        start_node = start_nodes[i]
+        
+        # --- A. ヒートマップ (次元ごとの活動度) ---
+        plt.figure(figsize=(12, 6))
+        # 転置して (z_dim, SeqLen) にする -> 横軸が時間
+        sns.heatmap(z_seq.T, cmap="viridis", center=0, cbar=True)
+        plt.title(f"Latent State Heatmap (Sample {i}, Start Node {start_node})")
+        plt.xlabel("Time Step")
+        plt.ylabel("Dimension Index (0-15)")
+        
+        # 上部にルート情報を表示（スペースの都合で間引く）
+        if seq_len < 50:
+            step_ticks = np.arange(seq_len)
+            plt.xticks(step_ticks + 0.5, route[:seq_len], rotation=90, fontsize=8)
+        
+        save_path = stamp(f"z_heatmap_sample_{i}.png")
+        plt.savefig(save_path)
+        plt.close()
+        
+        # --- B. ラインプロット (次元ごとの波形) ---
+        # 16次元を 4x4 または 縦に並べて表示
+        fig, axes = plt.subplots(z_dim, 1, figsize=(10, 2 * z_dim), sharex=True)
+        
+        # x軸（時間）
+        t = np.arange(seq_len)
+        
+        for dim in range(z_dim):
+            ax = axes[dim]
+            val = z_seq[:, dim]
+            ax.plot(t, val, label=f"Dim {dim}", color="tab:blue")
+            ax.axhline(0, color='gray', linestyle='--', linewidth=0.5)
+            ax.set_ylabel(f"dim {dim}", rotation=0, labelpad=20)
+            ax.grid(True, alpha=0.3)
+            
+            # 背景色で「滞在」と「移動」を区別するアイデア
+            # (値が一定なら滞在、変動すれば移動、のように見えるか確認)
+            
+        plt.xlabel("Time Step")
+        plt.suptitle(f"Latent Dynamics by Dimension (Sample {i})", y=1.00)
+        plt.tight_layout()
+        
+        save_path_line = stamp(f"z_lines_sample_{i}.png")
+        plt.savefig(save_path_line)
+        plt.close()
+        
+        print(f"Saved 16-dim visualization for sample {i}")
+
+def visualize_eigen_projection(model, z_history_list, routes_list, run_id):
+    """
+    zの軌跡を、Aの固有ベクトル空間に射影して可視化する。
+    これにより、「減衰モード」や「振動モード」ごとの寄与度を確認できる。
+    """
+    import seaborn as sns
+    
+    print("\n--- Visualizing Eigen-Projections ---")
+    
+    # 1. A行列の固有分解
+    A_np = model.A.detach().cpu().numpy()
+    eigenvalues, eigenvectors = np.linalg.eig(A_np)
+    
+    # 逆行列 V^{-1} を計算 (これが射影行列になる)
+    try:
+        V_inv = np.linalg.inv(eigenvectors)
+    except np.linalg.LinAlgError:
+        print("Matrix A is singular/defective. Cannot project.")
+        return
+
+    # 固有値の絶対値（|λ|）で降順ソートするためのインデックス
+    # |λ|が大きい（1に近い）＝「なかなか減衰しない（記憶維持）モード」
+    # |λ|が小さい（0に近い）＝「すぐに消える（短期記憶）モード」
+    sort_idx = np.argsort(np.abs(eigenvalues))[::-1]
+    
+    sorted_evals = eigenvalues[sort_idx]
+    sorted_V_inv = V_inv[sort_idx, :] # 行を並べ替え
+
+    # 全サンプル可視化
+    num_samples = min(len(z_history_list), 8)
+    
+    for i in range(num_samples):
+        # [SeqLen, z_dim]
+        z_seq = np.array(z_history_list[i]) 
+        
+        # 2. 射影変換: z_tilde = (V^{-1} @ z.T).T -> z @ (V^{-1}).T
+        # 結果は複素数になる
+        z_projected_complex = z_seq @ sorted_V_inv.T
+        
+        # 3. 振幅（絶対値）を取る
+        z_projected_abs = np.abs(z_projected_complex)
+        
+        # --- 可視化 ---
+        plt.figure(figsize=(14, 8))
+        
+        # ヒートマップ (横軸:時間, 縦軸:固有モード)
+        # 上の行ほど |λ| が大きい（長持ちする）モード
+        sns.heatmap(z_projected_abs.T, cmap="magma", center=0, cbar=True)
+        
+        # 軸ラベルの装飾
+        plt.title(f"Eigen-Mode Projection (Sample {i})\nTop rows = Slow Dynamics (|λ|≈1), Bottom rows = Fast Decay (|λ|≈0)")
+        plt.xlabel("Time Step")
+        plt.ylabel("Eigen Mode (Sorted by |λ|)")
+        
+        # Y軸に固有値の大きさを表示
+        ytick_labels = [f"|λ|={np.abs(lam):.2f}" for lam in sorted_evals]
+        plt.yticks(np.arange(len(ytick_labels)) + 0.5, ytick_labels, rotation=0, fontsize=8)
+        
+        # 上部にルート情報（ノードID）を表示
+        route = routes_list[i]
+        if len(route) < 100:
+            ax = plt.gca()
+            ax2 = ax.twiny()
+            ax2.set_xlim(ax.get_xlim())
+            ax2.set_xticks(np.arange(len(z_seq)) + 0.5)
+            # ルート情報は最初の部分だけ
+            disp_len = min(len(z_seq), len(route))
+            ax2.set_xticklabels(route[:disp_len], rotation=90, fontsize=8)
+        
+        save_path = stamp(f"z_eigen_proj_sample_{i}.png")
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Saved eigen-projection for sample {i}")
 
 def main():
     if not os.path.exists(ADJ_PATH):
@@ -496,6 +652,8 @@ def main():
     
     visualize_trajectory_with_time(all_z_histories, all_routes, target_start_nodes, title="routes")
     visualize_trajectory_3d(all_z_histories, all_routes, target_start_nodes, title="routes")
+    visualize_z_all_dimensions(all_z_histories, all_routes, target_start_nodes, run_id)
+    visualize_eigen_projection(model, all_z_histories, all_routes, run_id)
 
 if __name__ == "__main__":
     main()
