@@ -21,10 +21,10 @@ wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
     "epochs": 200, 
-    "batch_size": 32, # 系列が長くなるので、メモリ溢れするならここを減らす
+    "batch_size": 128, # 系列が長くなるので、メモリ溢れするならここを減らす
     "d_ie": 64,
     "head_num": 4, 
-    "d_ff": 128, 
+    "d_ff": 32, 
     "B_de": 3,
     "z_dim": 16,
     "eos_weight": 3.0, 
@@ -51,7 +51,7 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real1123_2.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
@@ -258,10 +258,12 @@ for epoch in range(wandb.config.epochs):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
     
     for batch in pbar:
-        route_batch, _, agent_batch = batch 
+        route_batch, time_batch, agent_batch = batch
+
         route_batch = route_batch.to(device)
         agent_batch = agent_batch.to(device)
-        
+        time_batch = time_batch.to(device)
+
         tokenizer = Tokenization(network)
         input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
         target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
@@ -289,7 +291,7 @@ for epoch in range(wandb.config.epochs):
         # === ★デバッグ用コード追加終了 ===
 
         # ★修正: 4つの戻り値を受け取る (u_allが必要)
-        logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)        
+        logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch, time_tensor=time_batch)        
         
         # 1. CE Loss (全員共通)
         loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
@@ -418,16 +420,18 @@ for epoch in range(wandb.config.epochs):
     }    
 
     with torch.no_grad():
-        for route_batch, _, agent_batch in val_loader:
+        for route_batch, time_batch, agent_batch in val_loader:
+            
             route_batch = route_batch.to(device)
             agent_batch = agent_batch.to(device)
-            
+            time_batch = time_batch.to(device)
+
             tokenizer = Tokenization(network)
             input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
             stay_counts = tokenizer.calculate_stay_counts(input_tokens)
 
-            logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)
+            logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch, time_tensor=time_batch)
 
             loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
             loss_total = loss_ce 

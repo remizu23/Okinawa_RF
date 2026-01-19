@@ -20,12 +20,12 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 300, 
+    "epochs": 200, 
     "batch_size": 128, # 系列が長くなるので、メモリ溢れするならここを減らす
     "d_ie": 64,
     "head_num": 4, 
-    "d_ff": 32, 
-    "B_de": 6,
+    "d_ff": 128, 
+    "B_de": 3,
     "z_dim": 16,
     "eos_weight": 3.0, 
     "stay_weight": 1,
@@ -37,7 +37,7 @@ wandb.config = type("C", (), {
     "max_stay_count": 500, # 必要に応じて調整
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
     "koopman_alpha": 0.1       # Koopman Lossの重み
 })()
 
@@ -51,7 +51,7 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real3.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
@@ -244,7 +244,8 @@ history = {
     "train_ce": [], "val_ce": [],         # 次トークン予測
     "train_dyn": [], "val_dyn": [],       # 多ステップ予測
     "train_linear": [], "val_linear": [], # 単ステップ線形 (Loss K)
-    "train_count": [], "val_count": []    # 滞在数予測
+    "train_count": [], "val_count": [],   # 滞在数予測
+    "train_mode": [], "val_mode": []    # モード予測
 }
 
 
@@ -252,15 +253,17 @@ for epoch in range(wandb.config.epochs):
     # --- Training ---
     model.train()
     epoch_metrics = {
-        "loss": 0.0, "ce": 0.0, "dyn": 0.0, "linear": 0.0, "count": 0.0
+        "loss": 0.0, "ce": 0.0, "dyn": 0.0, "linear": 0.0, "count": 0.0, "mode":0.0
     }
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
     
     for batch in pbar:
-        route_batch, _, agent_batch = batch 
+        route_batch, time_batch, agent_batch = batch
+
         route_batch = route_batch.to(device)
         agent_batch = agent_batch.to(device)
-        
+        time_batch = time_batch.to(device)
+
         tokenizer = Tokenization(network)
         input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
         target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
@@ -288,7 +291,7 @@ for epoch in range(wandb.config.epochs):
         # === ★デバッグ用コード追加終了 ===
 
         # ★修正: 4つの戻り値を受け取る (u_allが必要)
-        logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)        
+        logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch, time_tensor=time_batch)        
         
         # 1. CE Loss (全員共通)
         loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
@@ -354,14 +357,14 @@ for epoch in range(wandb.config.epochs):
             # 1. まず、すべてを「無視 (-100)」で初期化
             target_modes = torch.full_like(target_tokens, -100)  # target_modes: [Batch, Seq]
 
+            base_N = 19                 # 純ノード数
+            STAY_OFFSET = base_N        # 19
+            PAD_TOKEN  = 2 * base_N     # 38
+
             # 2. Moveトークン (0 <= ID < 19) の場所を "1" に設定
-            is_move = (target_tokens >= 0) & (target_tokens < network.N)
+            is_move = (target_tokens >= 0) & (target_tokens < STAY_OFFSET)
             target_modes[is_move] = 1
 
-            # 3. Stayトークン (19 <= ID < 38) の場所を "0" に設定
-            # STAY_OFFSET = 19, PAD_TOKEN = 38 (network.N * 2)
-            STAY_OFFSET = network.N
-            PAD_TOKEN = network.N * 2
             is_stay = (target_tokens >= STAY_OFFSET) & (target_tokens < PAD_TOKEN)
             target_modes[is_stay] = 0
 
@@ -382,9 +385,9 @@ for epoch in range(wandb.config.epochs):
             # ★★★ ここを変えたらvalidationの方も変える！！★★★
             loss_total = loss_ce + \
                         wandb.config.koopman_alpha * loss_k + \
-                        0.001 * loss_count + \
-                        0.1 * loss_dyn
-                        #    0.1 * loss_mode
+                        0.01 * loss_count + \
+                        1 * loss_dyn
+                        # 0.1 * loss_mode
 
         optimizer.zero_grad()
         loss_total.backward()
@@ -396,6 +399,7 @@ for epoch in range(wandb.config.epochs):
         epoch_metrics["dyn"] += loss_dyn.item() if wandb.config.use_koopman_loss else 0
         epoch_metrics["linear"] += loss_k.item() if wandb.config.use_koopman_loss else 0
         epoch_metrics["count"] += loss_count.item() if wandb.config.use_koopman_loss else 0
+        epoch_metrics["mode"] += loss_mode.item() if wandb.config.use_koopman_loss else 0
 
         pbar.set_postfix(loss=loss_total.item())
 
@@ -406,25 +410,28 @@ for epoch in range(wandb.config.epochs):
     history["train_dyn"].append(epoch_metrics["dyn"] / n_batches)
     history["train_linear"].append(epoch_metrics["linear"] / n_batches)
     history["train_count"].append(epoch_metrics["count"] / n_batches)
+    history["train_mode"].append(epoch_metrics["mode"] / n_batches)
 
 
 # --- Validation (ロジックはTrainと全く同じ) ---
     model.eval()
     epoch_metrics_val = {
-        "loss": 0.0, "ce": 0.0, "dyn": 0.0, "linear": 0.0, "count": 0.0
+        "loss": 0.0, "ce": 0.0, "dyn": 0.0, "linear": 0.0, "count": 0.0, "mode": 0.0
     }    
 
     with torch.no_grad():
-        for route_batch, _, agent_batch in val_loader:
+        for route_batch, time_batch, agent_batch in val_loader:
+            
             route_batch = route_batch.to(device)
             agent_batch = agent_batch.to(device)
-            
+            time_batch = time_batch.to(device)
+
             tokenizer = Tokenization(network)
             input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
             stay_counts = tokenizer.calculate_stay_counts(input_tokens)
 
-            logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch)
+            logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch, time_tensor=time_batch)
 
             loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
             loss_total = loss_ce 
@@ -477,15 +484,16 @@ for epoch in range(wandb.config.epochs):
 
                 loss_total = loss_ce + \
                             wandb.config.koopman_alpha * loss_k + \
-                            0.001 * loss_count + \
-                            0.1 * loss_dyn
-                            #    0.1 * loss_mode
+                            0.01 * loss_count + \
+                            1 * loss_dyn
+                            # 0.1 * loss_mode
 
             epoch_metrics_val["loss"] += loss_total.item()
             epoch_metrics_val["ce"] += loss_ce.item()
             epoch_metrics_val["dyn"] += loss_dyn.item() if wandb.config.use_koopman_loss else 0
             epoch_metrics_val["linear"] += loss_k.item() if wandb.config.use_koopman_loss else 0
             epoch_metrics_val["count"] += loss_count.item() if wandb.config.use_koopman_loss else 0
+            epoch_metrics_val["mode"] += loss_mode.item() if wandb.config.use_koopman_loss else 0
 
         # 平均計算 & 履歴保存
         n_val = len(val_loader)
@@ -494,6 +502,7 @@ for epoch in range(wandb.config.epochs):
         history["val_dyn"].append(epoch_metrics_val["dyn"] / n_val)
         history["val_linear"].append(epoch_metrics_val["linear"] / n_val)
         history["val_count"].append(epoch_metrics_val["count"] / n_val)
+        history["val_mode"].append(epoch_metrics_val["mode"] / n_val)
 
         print(f"Epoch {epoch+1}: Train Loss = {history['train_loss'][-1]:.4f} | Val Loss = {history['val_loss'][-1]:.4f}")
         
@@ -574,10 +583,16 @@ try:
     ax.legend()
     ax.grid(True)
     
-    # 6. 空きスペース (または各Lossの比率などを描画しても良い)
+    # 6. Mode reconstruction Loss
     ax = axes[1, 2]
-    ax.axis('off') # 何も表示しない
-    
+    # ax.axis('off') # 何も表示しない
+    ax.plot(epochs_range, history["train_mode"], label='Train', marker='.', color='olive')
+    ax.plot(epochs_range, history["val_mode"], label='Val', marker='.', color='yellowgreen')
+    ax.set_title('Mode Reconstruction (MSE)')
+    ax.legend()
+    ax.grid(True)
+
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # タイトル分のスペースを空ける
     
     graph_filename = stamp(f"loss_graph_detailed_{run_id}.png")

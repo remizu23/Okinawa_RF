@@ -112,16 +112,18 @@ class KoopmanRoutesFormer(nn.Module):
         # ★追加: 特別な埋め込み層
         # 年埋め込み: 2025年用 (バイナリ的なものなので1つあればいいが、汎用的にするならEmbedding)
         # ここでは単純に「2025年フラグが立った時に足すベクトル」として定義
-        self.year_2025_embedding = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
-        
-        # 広場埋め込み: ノード2番用
-        self.plaza_embedding = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        # token_vec に足すため、次元は token_emb_dim に合わせる
+        self.year_2025_embedding = nn.Parameter(torch.randn(1, 1, token_emb_dim) * 0.02)
 
-    def forward(self, tokens, stay_counts, agent_ids):
+        # 広場埋め込み: ノード2番用
+        self.plaza_embedding = nn.Parameter(torch.randn(1, 1, token_emb_dim) * 0.02)        
+        
+    def forward(self, tokens, stay_counts, agent_ids, time_tensor=None): # ★引数 time_tensor 追加
         """
         tokens: [Batch, Seq]
         stay_counts: [Batch, Seq]
-        agent_ids: [Batch]  (各系列に1つのID)
+        agent_ids: [Batch]
+        time_tensor: [Batch] (YYYYMMDDHHmm形式の整数) -> 追加
         """
         batch_size, seq_len = tokens.size()
 
@@ -129,23 +131,50 @@ class KoopmanRoutesFormer(nn.Module):
         token_vec = self.token_embedding(tokens)        # [B, T, token_dim]
         stay_vec = self.stay_embedding(stay_counts)     # [B, T, stay_dim]
         
+        # ★★★ ここで条件付き埋め込みを加算する (u_all結合の前！) ★★★
+        if time_tensor is not None:
+            # A. 年の判定 (2025年かどうか)
+            # time_tensor: [B] -> [B, 1, 1] に拡張
+            years = time_tensor // 100000000
+            is_2025 = (years == 2025).view(batch_size, 1, 1)
+            
+            # token_vec に 2025年埋め込みを加算
+            # is_2025 が True のバッチだけ加算される
+            token_vec = token_vec + self.year_2025_embedding * is_2025.float()
+
+            # B. 広場ノードの判定 (2025年 かつ Node=2 or 21)
+            # ノードID 2 (移動) と 21 (滞在: 2+50-31) を対象とする
+            # tokens: [B, T] -> [B, T, 1] に拡張
+            target_mask = (tokens == 2) | (tokens == 21)
+            target_mask = target_mask.unsqueeze(-1) # [B, T, 1]
+            
+            # 条件: 「2025年」かつ「対象ノード」
+            condition_plaza = is_2025.float() * target_mask.float()
+            
+            # token_vec に 広場埋め込みを加算
+            token_vec = token_vec + self.plaza_embedding * condition_plaza
+        # ★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★★
+
         # AgentIDは系列全体で共通なので拡張する
         agent_vec = self.agent_embedding(agent_ids)     # [B, agent_dim]
         agent_vec = agent_vec.unsqueeze(1).expand(-1, seq_len, -1) # [B, T, agent_dim]
 
-        # ★結合 (Concatenate) -> これが新しい u_t 全体
+        # ★結合 (Concatenate)
+        # token_vec が既に修正されているため、u_all にも年/広場の情報が含まれる！
         u_all = torch.cat([token_vec, stay_vec, agent_vec], dim=-1) # [B, T, total_dim]
         
         # Koopman用の入力 u_curr (最後の時刻を除く)
         u_curr = u_all[:, :-1, :]
 
         # --- 2. Transformerへの入力 ---
+        # u_all が修正済みなので、ここも自動的に反映される
         x = self.input_proj(u_all) # 次元圧縮 [B, T, d_model]
         x = self.pos_encoder(x)
         
         # マスク作成 (変更なし)
         causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
         pad_mask = (tokens == self.token_embedding.padding_idx).to(x.device)
+
         # --- 3. 状態推定 (h_t) ---
         h = self.transformer_block(
             src=x, 
@@ -158,11 +187,14 @@ class KoopmanRoutesFormer(nn.Module):
         z_curr = z_hat[:, :-1, :]
 
         # --- 5. Koopman Dynamics ---
-        # z_{t+1} = A * z_t + B * u_t (u_t は結合ベクトル)
+        # z_{t+1} = A * z_t + B * u_t
+        # u_curr (u_all) にも修正が反映されているので、Koopman予測も「広場がある前提」で行われる
         z_pred_next = (
             torch.einsum("ij,btj->bti", self.A, z_curr) + 
             torch.einsum("ij,btj->bti", self.B, u_curr)
         )
 
         logits = self.to_logits(z_hat)
+        
+        # 修正された u_all が返る
         return logits, z_hat, z_pred_next, u_all
