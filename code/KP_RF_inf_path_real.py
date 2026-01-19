@@ -22,16 +22,97 @@ except ImportError:
 # ★設定変更エリア
 # =========================================================
 # パディングトークン定義 (v3仕様)
-PAD_TOKEN = 38 
+PAD_TOKEN = 38
 STAY_OFFSET = 19
 VOCAB_SIZE = 39 
 
 # 入力データパス
-REAL_DATA_PATH = "/home/mizutani/projects/RF/data/input_real_test.npz"
+REAL_DATA_PATH = "/home/mizutani/projects/RF/data/input_e_test.npz"
 
 # モデルパス
-MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260112_190847/model_weights_20260112_190847.pth"
-MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260111_190040/model_weights_best_20260111_190040.pth"
+MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260118_211219/model_weights_20260118_211219.pth"
+MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260118_211856/model_weights_20260118_211856.pth"
+
+# =========================================================
+# ★ 地理的評価用設定 (2-hop対応版)
+# =========================================================
+ADJACENCY_MAP = {
+    0: [1, 2, 4, 11],
+    1: [0, 2, 4, 5, 9],
+    2: [0, 1, 5, 6, 7],
+    4: [0, 1, 5, 8, 9, 10, 11],
+    5: [1, 2, 4, 6, 10],
+    6: [2, 5, 7, 10, 14],
+    7: [2, 6, 13, 14, 15],
+    8: [4, 9, 11],
+    9: [1, 4, 8, 10, 12],
+    10: [4, 5, 6, 9, 12, 13],
+    11: [0, 4, 8],
+    12: [9, 10, 13],
+    13: [7, 10, 12, 14, 15],
+    14: [6, 7, 13, 15, 16],
+    15: [7, 13, 14],
+    16: [14, 17, 18],
+    17: [16, 18],
+    18: [16, 17]
+}
+
+# --- 距離行列の事前計算 (ここが重要) ---
+def build_distance_matrix(adj_map):
+    G = nx.Graph()
+    for u, neighbors in adj_map.items():
+        for v in neighbors:
+            G.add_edge(u, v)
+    
+    # 全ノード間の最短ホップ数を計算 (辞書の辞書形式)
+    # dists[0][4] = 1, dists[0][9] = 2 ... のようにアクセス可能
+    dists = dict(nx.all_pairs_shortest_path_length(G))
+    return dists
+
+# グローバル変数として保持
+NODE_DISTANCES = build_distance_matrix(ADJACENCY_MAP)
+
+
+def get_node_id(token):
+    """トークンID(Move/Stay)を純粋なノードID(0-18)に変換"""
+    if token == PAD_TOKEN:
+        return -1
+    if token >= STAY_OFFSET:
+        return token - STAY_OFFSET
+    return token
+
+def get_geo_cost(t1, t2):
+    """
+    地理的コスト関数 (距離に応じた可変ペナルティ)
+    """
+    if t1 == t2:
+        return 0.0
+    
+    n1 = get_node_id(t1)
+    n2 = get_node_id(t2)
+    
+    # パディング等は最大ペナルティ
+    if n1 == -1 or n2 == -1:
+        return 1.0
+    
+    # 場所が同じならコスト0 (Move/Stayの違いを許容)
+    if n1 == n2:
+        return 0.0
+    
+    # 距離テーブルからホップ数を取得
+    # ノードがつながっていない場合(到達不能)は最大ペナルティ
+    try:
+        dist = NODE_DISTANCES[n1][n2]
+    except KeyError:
+        return 1.0 
+
+    # --- ★距離に応じたコスト設定エリア★ ---
+    if dist == 1:
+        return 0.3  # 1つ隣 (Neighbour)
+    elif dist == 2:
+        return 0.6  # 2つ隣 (Near)
+    else:
+        return 1.0  # それ以上遠い (Far)
 
 
 # =========================================================
@@ -46,6 +127,8 @@ def save_log(msg):
     print(msg)
     with open(os.path.join(out_dir, "evaluation_log.txt"), "a") as f:
         f.write(msg + "\n")
+
+
 
 # =========================================================
 # 1. データ読み込み関数
@@ -176,6 +259,50 @@ def calc_dtw(seq1, seq2):
             dtw[i][j] = cost + min(dtw[i-1][j], dtw[i][j-1], dtw[i-1][j-1])
     return dtw[n][m]
 
+
+
+def calc_geo_dtw(seq1, seq2):
+    """地理的隣接を考慮したDTW (Geo-DTW)"""
+    n, m = len(seq1), len(seq2)
+    # DPテーブル初期化
+    dtw = [[float('inf')] * (m + 1) for _ in range(n + 1)]
+    dtw[0][0] = 0
+    
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            # コスト計算部分だけ変更
+            cost = get_geo_cost(seq1[i-1], seq2[j-1])
+            
+            # 累積コスト更新
+            dtw[i][j] = cost + min(dtw[i-1][j],    # 挿入
+                                   dtw[i][j-1],    # 削除
+                                   dtw[i-1][j-1])  # マッチ/置換
+            
+    return dtw[n][m]
+
+
+def calc_weighted_levenshtein(seq1, seq2):
+    """地理的隣接を考慮した重み付き編集距離"""
+    n, m = len(seq1), len(seq2)
+    # DPテーブル (現在の列と1つ前の列だけ持つことでメモリ節約も可能だが、わかりやすく2次元で)
+    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
+    
+    # 初期化 (挿入・削除コストは1.0固定とする)
+    for i in range(n + 1): dp[i][0] = float(i)
+    for j in range(m + 1): dp[0][j] = float(j)
+    
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            subst_cost = get_geo_cost(seq1[i-1], seq2[j-1])
+            
+            dp[i][j] = min(
+                dp[i-1][j] + 1.0,        # 削除
+                dp[i][j-1] + 1.0,        # 挿入
+                dp[i-1][j-1] + subst_cost # 置換
+            )
+    return dp[n][m]
+
+
 def evaluate_models(model_koopman, model_normal, test_data, prompt_len=15, device='cuda'):
     results = []
     print(f"Evaluating on {len(test_data)} test trajectories...")
@@ -198,21 +325,34 @@ def evaluate_models(model_koopman, model_normal, test_data, prompt_len=15, devic
         pred_k_future = predict_trajectory(model_koopman, prompt_seq, pred_len, agent_id, device)
         pred_n_future = predict_trajectory(model_normal, prompt_seq, pred_len, agent_id, device)
         
-        # 指標計算
+        # --- 既存指標 (Levenshtein, DTW) ---
         dist_k_lev = Levenshtein.distance(to_str(gt_future), to_str(pred_k_future))
         dist_n_lev = Levenshtein.distance(to_str(gt_future), to_str(pred_n_future))
         
         dist_k_dtw = calc_dtw(gt_future, pred_k_future)
         dist_n_dtw = calc_dtw(gt_future, pred_n_future)
+
+        # --- ★追加: 地理的評価指標 (Geo-DTW, Geo-Lev) ---
+        geo_k_dtw = calc_geo_dtw(gt_future, pred_k_future)
+        geo_n_dtw = calc_geo_dtw(gt_future, pred_n_future)
         
+        geo_k_lev = calc_weighted_levenshtein(gt_future, pred_k_future)
+        geo_n_lev = calc_weighted_levenshtein(gt_future, pred_n_future)
+
         results.append({
             'id': agent_id,
             'type': data['type'],
             'total_len': total_len,
-            'score_k_lev': dist_k_lev / pred_len, # Normalized
+            # Normal scores
+            'score_k_lev': dist_k_lev / pred_len, 
             'score_n_lev': dist_n_lev / pred_len,
             'score_k_dtw': dist_k_dtw / pred_len,
             'score_n_dtw': dist_n_dtw / pred_len,
+            'geo_k_dtw': geo_k_dtw / pred_len,
+            'geo_n_dtw': geo_n_dtw / pred_len,
+            'geo_k_lev': geo_k_lev / pred_len,
+            'geo_n_lev': geo_n_lev / pred_len,
+            
             'prompt': prompt_seq,
             'gt': gt_future,
             'pred_k': pred_k_future,
@@ -223,6 +363,7 @@ def evaluate_models(model_koopman, model_normal, test_data, prompt_len=15, devic
             print(f"Processed {i+1}/{len(test_data)}...", end='\r')
             
     return pd.DataFrame(results)
+
 
 # =========================================================
 # 4. 可視化ロジック (★修正: PDF一括出力)
@@ -319,8 +460,8 @@ def _plot_on_axis(ax, row):
     # タイトル作成 (スコア表示)
     # K: Koopman, N: Normal, E: ED(Levenshtein), D: DTW
     title_str = (f"ID:{row['id']} Len:{row['total_len']}\n"
-                 f"K [ED:{row['score_k_lev']:.2f}, DTW:{row['score_k_dtw']:.2f}]\n"
-                 f"N [ED:{row['score_n_lev']:.2f}, DTW:{row['score_n_dtw']:.2f}]")
+                 f"K [ED:{row['score_k_lev']:.2f}, DTW:{row['score_k_dtw']:.2f}, geoED:{row['geo_k_lev']:.2f}, geoDTW:{row['geo_k_dtw']:.2f}]\n"
+                 f"N [ED:{row['score_n_lev']:.2f}, DTW:{row['score_n_dtw']:.2f}, geoED:{row['geo_n_lev']:.2f}, geoDTW:{row['geo_n_dtw']:.2f}]")
     
     ax.set_title(title_str, fontsize=9)
     ax.set_yticks(range(0, 19, 2)) # 目盛りを少し間引く
@@ -374,7 +515,13 @@ if __name__ == "__main__":
         save_log(df_res[['score_k_lev', 'score_n_lev']].mean().to_string())
         save_log("DTW (Norm):")
         save_log(df_res[['score_k_dtw', 'score_n_dtw']].mean().to_string())
-
+        
+        # 全体平均ログ (追加)
+        save_log("Geo-Lev (Norm) [Lower is Better, Neighbor Bonus]:")
+        save_log(df_res[['geo_k_lev', 'geo_n_lev']].mean().to_string())
+        save_log("Geo-DTW (Norm) [Lower is Better, Neighbor Bonus]:")
+        save_log(df_res[['geo_k_dtw', 'geo_n_dtw']].mean().to_string())
+        
         # ★PDF一括出力 (変更箇所)
         pdf_path = os.path.join(out_dir, "all_trajectories.pdf")
         save_all_plots_to_pdf(df_res, pdf_path)

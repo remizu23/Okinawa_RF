@@ -109,6 +109,14 @@ class KoopmanRoutesFormer(nn.Module):
         # 6. zからの移動/滞在
         self.mode_classifier = nn.Linear(z_dim, 2) # [Stay, Move]の2値分類
 
+        # ★追加: 特別な埋め込み層
+        # 年埋め込み: 2025年用 (バイナリ的なものなので1つあればいいが、汎用的にするならEmbedding)
+        # ここでは単純に「2025年フラグが立った時に足すベクトル」として定義
+        self.year_2025_embedding = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        
+        # 広場埋め込み: ノード2番用
+        self.plaza_embedding = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+
     def forward(self, tokens, stay_counts, agent_ids):
         """
         tokens: [Batch, Seq]
