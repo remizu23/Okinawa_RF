@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 import numpy as np
 import torch.nn.functional as F
+import networkx as nx
+
 
 # =========================================================
 #  設定：出力先ディレクトリ
@@ -27,10 +29,10 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m.npz')
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m2.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260119_200003/model_weights_20260119_200003.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260118_170512/model_weights_20260118_170512.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -38,9 +40,33 @@ ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.p
 # デバイス設定
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+def compute_shortest_path_distance_matrix(adj: torch.Tensor, directed: bool = False) -> torch.Tensor:
+    """All-pairs shortest-path hop distances from adjacency matrix.
+
+    Unreachable pairs are set to N+1.
+    """
+    if not isinstance(adj, torch.Tensor):
+        adj = torch.tensor(adj)
+    adj_cpu = adj.detach().cpu()
+    N = adj_cpu.shape[0]
+    G = nx.DiGraph() if directed else nx.Graph()
+    G.add_nodes_from(range(N))
+    rows, cols = torch.nonzero(adj_cpu, as_tuple=True)
+    edges = [(int(r), int(c)) for r, c in zip(rows, cols) if int(r) != int(c)]
+    G.add_edges_from(edges)
+
+    dist = torch.full((N, N), fill_value=N + 1, dtype=torch.long)
+    for s in range(N):
+        dist[s, s] = 0
+        for t, d in nx.single_source_shortest_path_length(G, s).items():
+            dist[s, t] = int(d)
+    return dist
+
 # =========================================================
 #  1. 評価指標の計算ロジック (維持)
 # =========================================================
+
 
 def levenshtein_distance(seq1, seq2):
     size_x = len(seq1) + 1
@@ -68,24 +94,12 @@ def levenshtein_distance(seq1, seq2):
 def evaluate_metrics(model, network, device):
     """
     データセットを使ってモデルの定量性能(Accuracy, Edit Distance)を評価する
-    【修正】time_arr を読み込み、モデルに渡すように変更
     """
-
     print("\n=== Evaluating Quantitative Metrics ===")
     
     # データのロード (Trainと同じ手順)
     trip_arr = trip_arrz['route_arr']
     route = torch.from_numpy(trip_arr)
-
-    # ★追加: 時刻データのロード
-    if 'time_arr' in trip_arrz:
-        time_arr = trip_arrz['time_arr']
-    else:
-        print("Warning: 'time_arr' not found. Using dummy times.")
-        time_arr = np.zeros(len(trip_arr), dtype=np.int64)
-
-    route = torch.from_numpy(trip_arr)
-    time_pt = torch.from_numpy(time_arr) # ★Tensor化
 
     if 'agent_ids' in trip_arrz:
         agent_ids_arr = trip_arrz['agent_ids']
@@ -97,7 +111,6 @@ def evaluate_metrics(model, network, device):
     # 時間短縮のためサンプル数を制限 (全データなら len(route))
     num_samples = min(len(route), 1000) 
     subset_route = route[:num_samples]
-    subset_times = time_pt[:num_samples] # ★サブセット作成
     subset_agents = torch.from_numpy(agent_ids_arr[:num_samples]).long()
     
     tokenizer = Tokenization(network)
@@ -113,8 +126,7 @@ def evaluate_metrics(model, network, device):
         for i in range(num_batches):
             batch_routes = subset_route[i*batch_size : (i+1)*batch_size].to(device)
             batch_agents = subset_agents[i*batch_size : (i+1)*batch_size].to(device)
-            batch_times = subset_times[i*batch_size : (i+1)*batch_size].to(device)
-
+            
             # 入力と正解
             input_tokens = tokenizer.tokenization(batch_routes, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(batch_routes, mode="next").long().to(device)
@@ -124,7 +136,7 @@ def evaluate_metrics(model, network, device):
 
             # ★修正: 4つの戻り値を受け取る (logits, z_hat, z_pred, u_all)
             # u_allは評価では使わないので _ で受ける
-            logits, _, _, _ = model(input_tokens, stay_counts, batch_agents, time_tensor=batch_times)
+            logits, _, _, _ = model(input_tokens, stay_counts, batch_agents)
             
             preds = torch.argmax(logits, dim=-1) # [B, T]
             
@@ -156,7 +168,7 @@ def evaluate_metrics(model, network, device):
 #  2. モデル関連関数 (修正版)
 # =========================================================
 
-def load_model(model_path, network):
+def load_model(model_path, network, dist_mat_base: torch.Tensor | None = None, base_N: int | None = None, dist_is_directed: bool = False):
     print(f"Loading model from: {model_path}")
     checkpoint = torch.load(model_path, map_location=device)
     
@@ -189,6 +201,11 @@ def load_model(model_path, network):
         d_ff=config['d_ff'],
         z_dim=config['z_dim'],
         pad_token_id=config['pad_token_id'],
+        # --- Δ距離(広場)バイアス用 ---
+        dist_mat_base=dist_mat_base,
+        base_N=base_N,
+        delta_bias_move_only=True,
+        dist_is_directed=dist_is_directed,
         num_agents=config.get('num_agents', 1),
         agent_emb_dim=config.get('agent_emb_dim', 16),
         # ★ここで検出した値を適用
@@ -213,10 +230,7 @@ def load_model(model_path, network):
 #  3. 生成ロジック (修正版)
 # =========================================================
 
-def generate_route(model, network, start_node_id, agent_id, max_len=500, strategy="sample", temperature=1.0, simulation_year=2024):
-    """
-    simulation_year: 2024 (広場なし) or 2025 (広場あり) を指定
-    """
+def generate_route(model, network, start_node_id, agent_id, max_len=500, strategy="sample", temperature=1.0):
     tokenizer = Tokenization(network)
     TOKEN_START = tokenizer.SPECIAL_TOKENS["<b>"]
     TOKEN_END   = tokenizer.SPECIAL_TOKENS["<e>"]
@@ -230,12 +244,6 @@ def generate_route(model, network, start_node_id, agent_id, max_len=500, strateg
     
     max_model_len = 500 #positional encodingやstay_countと同様
 
-    # ★追加: シミュレーション用の時刻テンソル作成
-    # Batchサイズ=1 なので要素数1のテンソル
-    # 例: 2025 -> 202501010000
-    dummy_time_val = int(f"{simulation_year}01010000")
-    time_tensor = torch.tensor([dummy_time_val], dtype=torch.long).to(device)
-
     with torch.no_grad():
         for _ in range(max_len):
             
@@ -248,7 +256,7 @@ def generate_route(model, network, start_node_id, agent_id, max_len=500, strateg
             agent_tensor = torch.tensor([agent_id], dtype=torch.long).to(device)
             
             # ★修正: 4番目の戻り値 u_all を受け取る
-            logits, z_hat, z_pred, u_all = model(input_tensor, stay_tensor, agent_tensor, time_tensor=time_tensor)
+            logits, z_hat, z_pred, u_all = model(input_tensor, stay_tensor, agent_tensor)
             
             # zの保存
             last_z = z_hat[0, -1, :].cpu().numpy()
@@ -1527,12 +1535,20 @@ def analyze_full_token_contribution(model, network, z_history_list, routes_list,
 
 
 def main():
-    global out_dir
     if not os.path.exists(ADJ_PATH):
         print(f"Error: Adjacency matrix not found at {ADJ_PATH}")
         return
 
     adj_matrix = torch.load(ADJ_PATH, weights_only=True)
+    # --- Δ距離(広場)バイアス用: base最短距離行列 ---
+    dist_is_directed = False
+    if adj_matrix.shape[0] == 38:
+        base_N = 19
+        base_adj = adj_matrix[:base_N, :base_N]
+    else:
+        base_adj = adj_matrix
+        base_N = int(base_adj.shape[0])
+    dist_mat_base = compute_shortest_path_distance_matrix(base_adj, directed=dist_is_directed)
     expanded_adj = expand_adjacency_matrix(adj_matrix)
     dummy_feature_dim = 1
     dummy_node_features = torch.zeros((len(adj_matrix), dummy_feature_dim))
@@ -1550,80 +1566,57 @@ def main():
         print(f"Error: Model file not found at {model_path}")
         return
 
-    model, config = load_model(model_path, network)
+    model, config = load_model(model_path, network, dist_mat_base=dist_mat_base, base_N=base_N, dist_is_directed=dist_is_directed)
     
-    # 定量評価 (ここはテストデータの年情報を使って評価される)
     acc, edit_dist = evaluate_metrics(model, network, device)
     
-    # 共通の解析 (固有値など、入力に依存しないもの)
+    metrics_file = stamp(f"metrics_{run_id}.txt")
+    with open(metrics_file, "w") as f:
+        f.write("=== Quantitative Metrics ===\n")
+        f.write(f"Run ID: {run_id}\n")
+        f.write(f"Model Path: {model_path}\n")
+        f.write(f"Use Koopman: {config.get('use_koopman_loss', 'Unknown')}\n")
+        f.write("-" * 30 + "\n")
+        f.write(f"Next Token Accuracy: {acc:.4f}\n")
+        f.write(f"Avg Edit Distance:   {edit_dist:.4f}\n")
+        f.write("============================\n")
+
     analyze_eigenvalues(model)
+
     analyze_stability_and_dynamics(model, network, device)
-    analyze_token_weights_in_eigen_space(model, network, run_id)
-
-    # --- シナリオごとの生成と比較 ---
-    scenarios = [2024, 2025]
-    target_start_nodes = [0, 1, 2, 3, 4, 5, 6, 7]
-    test_agent_id = 0
     
-    # 親ディレクトリの下に年ごとのフォルダを作る設定にするため、
-    # 既存の stamp 関数等をラップするか、ディレクトリを変更する
-    base_out_dir = out_dir 
+    all_z_histories = []
+    all_routes = []
+    all_u_histories = []
+    all_probs_histories = [] # ★追加
 
-    for year in scenarios:
-        print(f"\n==================================================")
-        print(f" Generating Routes for Year: {year}")
-        print(f"==================================================")
+    target_start_nodes = [0,1,2,3,4,5,6,7]
+    test_agent_id = 0
+    print(f"Generating routes from nodes: {target_start_nodes} for Agent ID: {test_agent_id}")
+    
+    for start_node in target_start_nodes:
+        route, z_hist, u_hist, probs_hist = generate_route(model, network, start_node, agent_id=test_agent_id, strategy="sample", temperature=1.0)
         
-        # 年ごとのサブディレクトリ作成
-        year_dir = os.path.join(base_out_dir, f"{year}")
-        os.makedirs(year_dir, exist_ok=True)
-        
-        # stamp関数を一時的に書き換え (あるいは可視化関数に保存パス引数を渡すのが綺麗だが、今回はstamp依存)
-        # グローバルの out_dir を書き換えるのが一番手っ取り早い
-        
-        out_dir = year_dir 
+        all_z_histories.append(z_hist)
+        all_routes.append(route)
+        all_u_histories.append(u_hist) # ★追加
+        all_probs_histories.append(probs_hist) # ★追加
 
-        all_z_histories = []
-        all_routes = []
-        all_u_histories = []
-        all_probs_histories = []
-
-        print(f"Generating routes from nodes: {target_start_nodes}")
-        
-        for start_node in target_start_nodes:
-            # ★修正: simulation_year を指定
-            route, z_hist, u_hist, probs_hist = generate_route(
-                model, network, start_node, 
-                agent_id=test_agent_id, 
-                strategy="sample", 
-                temperature=1.0,
-                simulation_year=year 
-            )
-            
-            all_z_histories.append(z_hist)
-            all_routes.append(route)
-            all_u_histories.append(u_hist)
-            all_probs_histories.append(probs_hist)
-
-        # 各年の結果を可視化
-        visualize_trajectory_with_time(all_z_histories, all_routes, target_start_nodes, title=f"routes_{year}")
-        visualize_trajectory_3d(all_z_histories, all_routes, target_start_nodes, title=f"routes_{year}")
-        
-        visualize_z_all_dimensions(all_z_histories, all_routes, target_start_nodes, run_id)
-        visualize_eigen_projection(model, all_z_histories, all_routes, run_id)
-        
-        # Forcing解析 (ここが広場の影響を最も強く受けるはず)
-        analyze_input_forcing(model, all_u_histories, all_routes, target_start_nodes, run_id)
-        
-        analyze_end_token_trigger(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
-        analyze_end_token_trigger_eigen(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
-        analyze_sequence_drivers_eigen(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
-        analyze_selection_probability(all_probs_histories, all_routes, target_start_nodes, run_id)
-        analyze_full_token_contribution(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
-
-    # 最後にグローバル変数を戻しておく (お行儀として)
-    out_dir = base_out_dir
-    print(f"\nAll comparison results saved to: {base_out_dir}")
+    visualize_trajectory_with_time(all_z_histories, all_routes, target_start_nodes, title="routes")
+    visualize_trajectory_3d(all_z_histories, all_routes, target_start_nodes, title="routes")
+    
+    # 既存の可視化
+    visualize_z_all_dimensions(all_z_histories, all_routes, target_start_nodes, run_id)
+    visualize_eigen_projection(model, all_z_histories, all_routes, run_id)
+    
+    # ★新規追加: 入力Forcingの可視化
+    analyze_input_forcing(model, all_u_histories, all_routes, target_start_nodes, run_id)
+    analyze_end_token_trigger(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
+    analyze_end_token_trigger_eigen(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
+    analyze_sequence_drivers_eigen(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
+    analyze_selection_probability(all_probs_histories, all_routes, target_start_nodes, run_id)
+    analyze_token_weights_in_eigen_space(model, network, run_id)
+    analyze_full_token_contribution(model, network, all_z_histories, all_routes, target_start_nodes, run_id)
 
 if __name__ == "__main__":
     main()

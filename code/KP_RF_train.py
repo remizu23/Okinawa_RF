@@ -8,6 +8,7 @@ import os
 from datetime import datetime
 from KP_RF import KoopmanRoutesFormer
 import matplotlib.pyplot as plt
+import networkx as nx
 
 # 自作モジュール
 from network import Network, expand_adjacency_matrix
@@ -21,10 +22,10 @@ wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
     "epochs": 200, 
-    "batch_size": 128, # 系列が長くなるので、メモリ溢れするならここを減らす
+    "batch_size": 32, # 系列が長くなるので、メモリ溢れするならここを減らす
     "d_ie": 64,
     "head_num": 4, 
-    "d_ff": 32, 
+    "d_ff": 128, 
     "B_de": 3,
     "z_dim": 16,
     "eos_weight": 3.0, 
@@ -43,6 +44,7 @@ wandb.config = type("C", (), {
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 # --- 保存ディレクトリ作成 ---
 out_dir = f"/home/mizutani/projects/RF/runs/{run_id}"
 os.makedirs(out_dir, exist_ok=True)
@@ -51,9 +53,57 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m2.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
+
+
+def compute_shortest_path_distance_matrix(adj: torch.Tensor, directed: bool = False) -> torch.Tensor:
+    """Compute all-pairs shortest-path hop distances from an adjacency matrix.
+
+    Parameters
+    ----------
+    adj:
+        [N,N] adjacency matrix (0/1 or weights). Non-zero entries are treated as edges.
+    directed:
+        If True, treat edges as directed; else undirected.
+
+    Returns
+    -------
+    dist:
+        [N,N] LongTensor with hop distances. Unreachable pairs get a large value (N+1).
+    """
+    if not isinstance(adj, torch.Tensor):
+        adj = torch.tensor(adj)
+    adj_cpu = adj.detach().cpu()
+    N = adj_cpu.shape[0]
+    G = nx.DiGraph() if directed else nx.Graph()
+    G.add_nodes_from(range(N))
+    rows, cols = torch.nonzero(adj_cpu, as_tuple=True)
+    edges = [(int(r), int(c)) for r, c in zip(rows, cols) if int(r) != int(c)]
+    G.add_edges_from(edges)
+
+    dist = torch.full((N, N), fill_value=N + 1, dtype=torch.long)
+    for s in range(N):
+        dist[s, s] = 0
+        for t, d in nx.single_source_shortest_path_length(G, s).items():
+            dist[s, t] = int(d)
+    return dist
+
+
+
+# --- Delta-distance-to-plaza: precompute base shortest-path distances ---
+# NOTE: adj_matrix is assumed to be the *base* adjacency (e.g., 19x19). If your saved
+# adjacency is already expanded (move+stay), compute distances on the first half only.
+dist_is_directed = False
+if adj_matrix.shape[0] == 38:
+    base_N = 19
+    base_adj = adj_matrix[:base_N, :base_N]
+else:
+    base_adj = adj_matrix
+    base_N = int(base_adj.shape[0])
+
+dist_mat_base = compute_shortest_path_distance_matrix(base_adj, directed=dist_is_directed)
 
 # 滞在トークン用に隣接行列を拡張
 expanded_adj = expand_adjacency_matrix(adj_matrix)
@@ -181,6 +231,11 @@ model = KoopmanRoutesFormer(
     d_ff=wandb.config.d_ff,
     z_dim=wandb.config.z_dim,
     pad_token_id=network.N,
+    # --- Δ距離(広場)バイアス用 ---
+    dist_mat_base=dist_mat_base,
+    base_N=base_N,
+    delta_bias_move_only=True,
+    dist_is_directed=dist_is_directed,
     # ★追加引数
     num_agents=num_agents,
     agent_emb_dim=wandb.config.agent_emb_dim,
@@ -258,12 +313,11 @@ for epoch in range(wandb.config.epochs):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
     
     for batch in pbar:
-        route_batch, time_batch, agent_batch = batch
-
+        route_batch, time_batch, agent_batch = batch 
         route_batch = route_batch.to(device)
         agent_batch = agent_batch.to(device)
         time_batch = time_batch.to(device)
-
+        
         tokenizer = Tokenization(network)
         input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
         target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
@@ -357,14 +411,14 @@ for epoch in range(wandb.config.epochs):
             # 1. まず、すべてを「無視 (-100)」で初期化
             target_modes = torch.full_like(target_tokens, -100)  # target_modes: [Batch, Seq]
 
-            base_N = 19                 # 純ノード数
-            STAY_OFFSET = base_N        # 19
-            PAD_TOKEN  = 2 * base_N     # 38
-
             # 2. Moveトークン (0 <= ID < 19) の場所を "1" に設定
-            is_move = (target_tokens >= 0) & (target_tokens < STAY_OFFSET)
+            is_move = (target_tokens >= 0) & (target_tokens < network.N)
             target_modes[is_move] = 1
 
+            # 3. Stayトークン (19 <= ID < 38) の場所を "0" に設定
+            # STAY_OFFSET = 19, PAD_TOKEN = 38 (network.N * 2)
+            STAY_OFFSET = network.N
+            PAD_TOKEN = network.N * 2
             is_stay = (target_tokens >= STAY_OFFSET) & (target_tokens < PAD_TOKEN)
             target_modes[is_stay] = 0
 
@@ -421,11 +475,10 @@ for epoch in range(wandb.config.epochs):
 
     with torch.no_grad():
         for route_batch, time_batch, agent_batch in val_loader:
-            
             route_batch = route_batch.to(device)
             agent_batch = agent_batch.to(device)
             time_batch = time_batch.to(device)
-
+            
             tokenizer = Tokenization(network)
             input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
