@@ -167,7 +167,72 @@ class KoopmanRoutesFormer(nn.Module):
         # 6. zからの移動/滞在
         self.mode_classifier = nn.Linear(z_dim, 2) # [Stay, Move]の2値分類
 
-    def forward(self, tokens, stay_counts, agent_ids, time_tensor=None, plaza_base_ids: int = [2]): #広場ノード:2番のみ
+        # ★★★ 広場判定用の定数を登録 (GPU計算用) ★★★
+        # Query Periods: 
+        # 1. 2025-11-22 10:00 ~ 19:00
+        # 2. 2025-11-23 10:00 ~ 17:00
+        # これらを「202511221000」のような整数形式で保持します
+        self.plaza_periods = [
+            (202511221000, 202511221900),
+            (202511231000, 202511231700)
+        ]
+
+# ★★★ ヘルパー関数: 時刻テンソルを「分単位の通算時間」に変換 ★★★
+    def _to_linear_minutes(self, t_tensor):
+        """
+        YYYYMMDDHHMM 形式の整数テンソルを、分単位の連続値に変換する。
+        （月をまたぐ計算は簡易化のため11月固定と仮定しますが、日は考慮します）
+        """
+        # 日、時、分を抽出
+        day = (t_tensor // 10000) % 100
+        hour = (t_tensor // 100) % 100
+        minute = t_tensor % 100
+        
+        # 1日=1440分, 1時間=60分
+        # 基準はとりあえず 0日0時0分 からの経過分とします
+        total_minutes = day * 1440 + hour * 60 + minute
+        return total_minutes
+
+
+    # ★★★ ヘルパー関数: 広場開催中かどうかの厳密判定 ★★★
+    def check_plaza_active(self, start_time_tensor, duration_steps):
+        """
+        start_time_tensor: [Batch]  (各バッチの開始時刻 YYYYMMDDHHMM)
+        duration_steps: int         (系列長 = 経過分数)
+        
+        Returns:
+            is_active: [Batch, 1, 1] (True/False mask, broadcastable)
+        """
+        batch_size = start_time_tensor.size(0)
+        device = start_time_tensor.device
+        
+        # 1. トリップの開始・終了時刻を「通算分」に変換
+        trip_start_mins = self._to_linear_minutes(start_time_tensor) # [Batch]
+        trip_end_mins = trip_start_mins + duration_steps            # [Batch]
+        
+        # 結果を格納するマスク（初期値False）
+        active_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        # 2. 定義された各期間との重複チェック
+        for (p_start_int, p_end_int) in self.plaza_periods:
+            # 期間の開始・終了も「通算分」に変換
+            # 定数ですが、broadcastのためにtensor化
+            p_start_mins = self._to_linear_minutes(torch.tensor(p_start_int, device=device))
+            p_end_mins   = self._to_linear_minutes(torch.tensor(p_end_int, device=device))
+            
+            # 重複判定ロジック:
+            # (TripStart < PeriodEnd) AND (TripEnd > PeriodStart)
+            # ※ 「少しでも被ればOK」なので、接するだけ(Start==End)は除外するなら不等号、含めるなら等号付き
+            # ここでは「時間幅を持つ」前提で厳密な不等号を使います
+            is_overlap = (trip_start_mins < p_end_mins) & (trip_end_mins > p_start_mins)
+            
+            # どれか一つの期間にでも被ればOK (OR演算)
+            active_mask = active_mask | is_overlap
+            
+        return active_mask.view(batch_size, 1, 1) # 放送用にreshape
+
+
+    def forward(self, tokens, stay_counts, agent_ids, time_tensor=None, plaza_base_ids: int = [2], return_debug=False): #広場ノード:2番のみ
         """
         tokens: [Batch, Seq]
         stay_counts: [Batch, Seq]
@@ -181,6 +246,16 @@ class KoopmanRoutesFormer(nn.Module):
             plaza_base_ids = torch.tensor(plaza_base_ids, device=device).long()
         else:
             plaza_base_ids = plaza_base_ids.to(device).long()
+
+        # --- 1. 広場のアクティブ判定 (厳密版) ---
+        if time_tensor is not None:
+            # ★★★ 修正: 単純な2025年判定ではなく、期間重複判定を使う ★★★
+            # time_tensor: [Batch] -> is_plaza_active: [Batch, 1, 1] (bool)
+            is_plaza_active_bool = self.check_plaza_active(time_tensor, seq_len)
+        else:
+            # 時刻がない場合は、デフォルトでFalse（あるいは推論時はTrueにしたい場合は引数制御）
+            # ここでは安全側に倒してFalse、もしくは「2025」とみなすならTrue
+            is_plaza_active_bool = torch.zeros(batch_size, 1, 1, dtype=torch.bool, device=device)
 
         # --- 1. 各埋め込みの取得 ---
         token_vec = self.token_embedding(tokens)        # [B, T, token_dim]
@@ -203,21 +278,13 @@ class KoopmanRoutesFormer(nn.Module):
         # B. 場所の判定: 「今いる場所」が「広場リストのどれか」に含まれるか？
         # isin を使って一括判定
         is_at_target_loc = torch.isin(curr_base, plaza_base_ids) & curr_is_node
+        is_at_target_loc = is_at_target_loc.unsqueeze(-1) # [B, T, 1]
         
-        # C. 年の判定: 「広場が存在する年(2025)」か？ (time_tensorがある場合)
-        if time_tensor is not None:
-            years = time_tensor // 100000000
-            # [Batch] -> [Batch, 1] に拡張して放送
-            is_active_year = (years == 2025).view(batch_size, 1)
-            # 場所が合致 AND 年も合致
-            is_plaza_active = is_at_target_loc & is_active_year
-        else:
-            # 時刻がない場合（推論時など）、デフォルトで有効にするか、
-            # もしくは引数で制御するかですが、一旦「場所が合えばON」とします
-            is_plaza_active = is_at_target_loc
+        # C. 最終的な広場フラグ: (場所にいる) AND (時間がアクティブ)
+        # is_plaza_active_bool は [B, 1, 1] なので T方向に放送される
+        plaza_status = is_at_target_loc & is_plaza_active_bool 
 
-        # D. 埋め込み取得 (True=1, False=0)
-        plaza_vec = self.plaza_embedding(is_plaza_active.long()) # [B, T, plaza_dim]
+        plaza_vec = self.plaza_embedding(plaza_status.long().squeeze(-1)) # [B, T, dim]
 
         # ★★★ 結合 (u_t に plaza_vec を追加) ★★★
         u_all = torch.cat([token_vec, stay_vec, agent_vec, plaza_vec], dim=-1)
@@ -266,6 +333,10 @@ class KoopmanRoutesFormer(nn.Module):
         logits = self.to_logits(z_hat)
 
         # --- Add delta-distance-to-plaza bias (optional) ---
+        base_logits = logits.clone() # バイアス足す前の素の予測値
+        final_dist_bias = torch.zeros_like(logits) # バイアス値
+        gate_value = torch.zeros(batch_size, seq_len, 1, device=tokens.device) # ゲート値
+
         if getattr(self, "dist_mat_base", None) is not None:
             # tokens: [B,T]
             pad_id = self.token_embedding.padding_idx
@@ -299,22 +370,17 @@ class KoopmanRoutesFormer(nn.Module):
             bin_idx = torch.where(delta > 0, torch.full_like(bin_idx, 2), bin_idx)
             # bin_idx shape: [B, T, V]
 
-            # ★★★ 修正箇所: 年に応じた重みの選択 ★★★
-            
-            # 1. 2024年用の重みマップを作成 [B, T, V]
-            # self.delta_bin_weight[0] は [3] (Toward, Same, Away)
-            w_2024 = self.delta_bin_weight[0][bin_idx] 
-            
-            # 2. 2025年用の重みマップを作成 [B, T, V]
-            w_2025 = self.delta_bin_weight[1][bin_idx]
-            
+            # ★★★ 修正: 重みの選択も厳密判定に基づく ★★★
+            w_inactive = self.delta_bin_weight[0][bin_idx] 
+            w_active   = self.delta_bin_weight[1][bin_idx]         
+
             # 3. データの年に応じてどちらを使うか選択
             # years: [B] -> [B, 1, 1]
             years = time_tensor // 100000000
             is_2025 = (years == 2025).view(batch_size, 1, 1)
             
-            # torch.where(条件, Trueの場合の値, Falseの場合の値)
-            w = torch.where(is_2025, w_2025, w_2024)
+            # is_plaza_active_bool: [B, 1, 1] -> 放送して切り替え
+            w = torch.where(is_plaza_active_bool, w_active, w_inactive)
 
             # Context gate g_t [B, T, 1]
             g = torch.sigmoid(self.delta_gate(z_hat))
@@ -323,6 +389,9 @@ class KoopmanRoutesFormer(nn.Module):
             time_mask = curr_is_node & (tokens_long != pad_id)
             g = g * time_mask.unsqueeze(-1).float()
 
+            # ★計算した値を保存
+            gate_value = g
+
             if self.delta_bias_move_only:
                 cand_mask = self.candidate_is_move.float().view(1, 1, -1)
             else:
@@ -330,6 +399,9 @@ class KoopmanRoutesFormer(nn.Module):
 
             # 最終的なバイアス項
             dist_bias = g * w * cand_mask
+
+            # ★保存
+            final_dist_bias = dist_bias
 
             # 2025年（広場あり）の時だけバイアスを有効にする（不使用：バイアスの程度を比べるため．）
             # if time_tensor is not None:
@@ -341,6 +413,58 @@ class KoopmanRoutesFormer(nn.Module):
             #     # 0.0 を掛ければバイアスは消滅する
             #     dist_bias = dist_bias * is_plaza_active
 
+            # =================================================================
+            # ★★★ 追加: 広場近傍 2-hop 限定マスク (Proximity Mask) ★★★
+            # =================================================================
+            # d_curr: [Batch, Seq] (現在地から最も近い広場への距離)
+            # 現在地が広場から 2-hop 以内なら 1.0, それ以外なら 0.0
+            
+            INFLUENCE_RADIUS = 2  # 2-hop以内
+            
+            # d_curr <= 2 の箇所だけ True
+            proximity_mask = (d_curr <= INFLUENCE_RADIUS).float().unsqueeze(-1) # [B, T, 1]
+            
+            # バイアスにマスクを掛ける (範囲外ならバイアスは0になる)
+            dist_bias = dist_bias * proximity_mask
+            # =================================================================
+
             logits = logits + dist_bias
             
-        return logits, z_hat, z_pred_next, u_all
+        # 戻り値の調整
+        if return_debug:
+            debug_info = {
+                "base_logits": base_logits,
+                "delta_bias": final_dist_bias,
+                "delta_gate": gate_value
+            }
+            # 既存の戻り値 + debug_info
+            return logits, z_hat, z_pred_next, u_all, debug_info
+        else:
+            # 通常時は今まで通り
+            return logits, z_hat, z_pred_next, u_all
+
+    def set_plaza_dist(self, full_dist_mat: torch.Tensor, plaza_id: int):
+        """
+        分析・シナリオ用に、特定のノード(plaza_id)を広場とした場合の距離行列をセットする。
+        full_dist_mat: [N, N] の全ペア最短距離行列
+        plaza_id: 広場とみなすノードID (0 ~ base_N-1)
+        """
+        if self.dist_mat_base is None:
+            return # 距離バイアス機能がないモデルなら無視
+
+        # 現在のバッファと同じデバイス・型にする
+        device = self.dist_mat_base.device
+        dtype = self.dist_mat_base.dtype
+        
+        # 本来は dist_mat_base は [N, N] 全体を持っていますが、
+        # モデル内では self.dist_mat_base[curr, plaza] のように参照しています。
+        # シナリオ分析では「広場IDが変わる」＝「参照する列が変わる」だけなので、
+        # 単純に dist_mat_base を外部から与えられた新しい行列で上書きします。
+        
+        self.dist_mat_base.data = full_dist_mat.to(device=device, dtype=dtype)
+        
+        # もし `forward` 内で plaza_base_ids を引数で受け取る仕様にしている場合、
+        # このメソッドは「距離行列そのもの」を更新するため、整合性が取れます。
+        # 呼び出し側は model(..., plaza_base_ids=[plaza_id]) と呼ぶ必要がありますが、
+        # 提示のスクリプトは `set_plaza_dist` で行列の状態を変える前提のようなので、
+        # これでOKです。 

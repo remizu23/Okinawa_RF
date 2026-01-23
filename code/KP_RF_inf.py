@@ -29,10 +29,10 @@ def stamp(name):
 #  設定：モデルとデータのパス
 # =========================================================
 
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m2.npz')
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m4.npz')
 
 # 学習済みモデルのパス
-MODEL_PATH = '/home/mizutani/projects/RF/runs/20260118_170512/model_weights_20260118_170512.pth'
+MODEL_PATH = '/home/mizutani/projects/RF/runs/20260121_145835/model_weights_20260121_145835.pth'
 
 # 隣接行列のパス
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
@@ -97,21 +97,31 @@ def evaluate_metrics(model, network, device):
     """
     print("\n=== Evaluating Quantitative Metrics ===")
     
-    # データのロード (Trainと同じ手順)
+    # データのロード
     trip_arr = trip_arrz['route_arr']
     route = torch.from_numpy(trip_arr)
 
+    # Agent IDのロード
     if 'agent_ids' in trip_arrz:
         agent_ids_arr = trip_arrz['agent_ids']
     else:
-        # なければ仮のID (全員0) を作成、あるいはエラーにする
         print("Warning: 'agent_ids' not found in npz. Using dummy IDs.")
         agent_ids_arr = np.zeros(len(trip_arr), dtype=int)
-    
-    # 時間短縮のためサンプル数を制限 (全データなら len(route))
+
+    # ★追加: Time情報のロード
+    if 'time_arr' in trip_arrz:
+        time_arr = trip_arrz['time_arr']
+    else:
+        print("Warning: 'time_arr' not found. Using dummy 2025 time.")
+        # ない場合は全員 2025/11/22 10:00 とする (広場あり評価のため)
+        time_arr = np.full(len(trip_arr), 202511221000, dtype=np.int64)
+
+    # サンプル数制限
     num_samples = min(len(route), 1000) 
     subset_route = route[:num_samples]
     subset_agents = torch.from_numpy(agent_ids_arr[:num_samples]).long()
+    # ★追加: サブセット抽出
+    subset_time = torch.from_numpy(time_arr[:num_samples]).long()
     
     tokenizer = Tokenization(network)
     model.eval()
@@ -122,21 +132,22 @@ def evaluate_metrics(model, network, device):
     
     batch_size = 64
     num_batches = (len(subset_route) + batch_size - 1) // batch_size
+    
     with torch.no_grad():
         for i in range(num_batches):
             batch_routes = subset_route[i*batch_size : (i+1)*batch_size].to(device)
             batch_agents = subset_agents[i*batch_size : (i+1)*batch_size].to(device)
+            # ★追加: Timeバッチ作成
+            batch_time = subset_time[i*batch_size : (i+1)*batch_size].to(device)
             
-            # 入力と正解
             input_tokens = tokenizer.tokenization(batch_routes, mode="simple").long().to(device)
             target_tokens = tokenizer.tokenization(batch_routes, mode="next").long().to(device)
             
-            # 滞在カウント計算
             stay_counts = tokenizer.calculate_stay_counts(input_tokens)
 
-            # ★修正: 4つの戻り値を受け取る (logits, z_hat, z_pred, u_all)
-            # u_allは評価では使わないので _ で受ける
-            logits, _, _, _ = model(input_tokens, stay_counts, batch_agents)
+            # ★修正: time_tensor を渡す
+            # 戻り値も4つで受け取る
+            logits, _, _, _ = model(input_tokens, stay_counts, batch_agents, time_tensor=batch_time)
             
             preds = torch.argmax(logits, dim=-1) # [B, T]
             
@@ -244,6 +255,8 @@ def generate_route(model, network, start_node_id, agent_id, max_len=500, strateg
     
     max_model_len = 500 #positional encodingやstay_countと同様
 
+    dummy_time = torch.tensor([202511221200], dtype=torch.long).to(device)
+
     with torch.no_grad():
         for _ in range(max_len):
             
@@ -256,7 +269,7 @@ def generate_route(model, network, start_node_id, agent_id, max_len=500, strateg
             agent_tensor = torch.tensor([agent_id], dtype=torch.long).to(device)
             
             # ★修正: 4番目の戻り値 u_all を受け取る
-            logits, z_hat, z_pred, u_all = model(input_tensor, stay_tensor, agent_tensor)
+            logits, z_hat, z_pred, u_all = model(input_tensor, stay_tensor, agent_tensor, time_tensor=dummy_time)            
             
             # zの保存
             last_z = z_hat[0, -1, :].cpu().numpy()
@@ -476,7 +489,7 @@ def analyze_stability_and_dynamics(model, network, device):
         with torch.no_grad():
             token_vec = model.token_embedding(node_indices)
             stay_vec = model.stay_embedding(dummy_counts)
-            agent_vec = model.agent_embedding(dummy_agents).unsqueeze(1) # shape合わせが必要かも
+            agent_vec = model.agent_embedding(dummy_agents)# shape合わせが必要かも
             # 簡易的にtoken_vecだけでBとの積を見る (uの主成分はtokenなので)
             # 正確には結合が必要ですが、傾向を見るにはこれでもOK
             
@@ -485,9 +498,16 @@ def analyze_stability_and_dynamics(model, network, device):
             # "入力 u によって z がどう動かされるか (B u)" だけを計算
             
             # KP_RF.pyのforwardを参考に u_all を作る
-            u_all = torch.cat([token_vec, stay_vec, model.agent_embedding(dummy_agents)], dim=-1)
-            u_np = u_all.cpu().numpy() # [N, input_dim]
+            # ★★★ 修正: ここに広場埋め込み(Plaza Embedding)を追加 ★★★
             
+            # 広場なし(0)の状態として作成
+            dummy_plaza_status = torch.zeros_like(node_indices).long().to(device) 
+            plaza_vec = model.plaza_embedding(dummy_plaza_status) # [N, 4]
+
+            # 結合: Token + Stay + Agent + Plaza (合計100次元になるはず)
+            u_all = torch.cat([token_vec, stay_vec, agent_vec, plaza_vec], dim=-1)
+            
+            u_np = u_all.cpu().numpy() # [N, input_dim]            
             # 各ノードの固定点 z* = (I-A)^(-1) * B * u
             # B: [z_dim, u_dim], u: [N, u_dim] -> B u.T : [z_dim, N]
             forcing = B_np @ u_np.T 

@@ -8,18 +8,21 @@ from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
 from KP_RF import KoopmanRoutesFormer
 import glob
+from datetime import datetime
 
 # =========================================================
 #  設定エリア
 # =========================================================
 # データパス
-DATA_PATH = '/home/mizutani/projects/RF/data/input_real3.npz'
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+DATA_PATH = '/home/mizutani/projects/RF/data/input_real_m4.npz'
 ADJ_PATH = '/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt'
 
-SPECIFIC_MODEL_PATH = '/home/mizutani/projects/RF/runs/20260118_170512/model_weights_20260118_170512.pth' # 指定する場合
+SPECIFIC_MODEL_PATH = '/home/mizutani/projects/RF/runs/20260121_145835/model_weights_20260121_145835.pth' # 指定する場合
 
 # 出力先
-OUT_DIR = '/home/mizutani/projects/RF/runs/Lin_test_2'
+OUT_DIR = f'/home/mizutani/projects/RF/runs/Lin_test_{run_id}'
 os.makedirs(OUT_DIR, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
