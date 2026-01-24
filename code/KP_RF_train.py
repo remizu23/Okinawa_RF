@@ -43,7 +43,7 @@ wandb.config = type("C", (), {
     "event_emb_dim": 4,
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
     "koopman_alpha": 0.1       # Koopman Lossの重み
 })()
 
@@ -58,7 +58,7 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m4_emb.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
@@ -370,6 +370,7 @@ for epoch in range(wandb.config.epochs):
         e_in  = align_ctx(e_b,  T)
 
         # Forward
+        # 戻り値の logits は "z_pred_next" (予測された未来) から生成されたものになっています
         logits, z_hat, z_pred_next, u_all = model(
             tokens=input_tokens, 
             stay_counts=stay_counts, 
@@ -377,10 +378,11 @@ for epoch in range(wandb.config.epochs):
             holidays=h_in,
             time_zones=tz_in,
             events=e_in,
-            time_tensor=None # Unused
+            time_tensor=None 
         )
 
         # 1. CE Loss (共通)
+        # logits(予測された次状態) と target_tokens(実際の次ノード) を比較
         loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
         
         # 初期化
@@ -388,93 +390,89 @@ for epoch in range(wandb.config.epochs):
         loss_count = torch.tensor(0.0, device=device)
         loss_dyn = torch.tensor(0.0, device=device)
         loss_k = torch.tensor(0.0, device=device)
-        loss_mode = torch.tensor(0.0, device=device) # モード損失
+        loss_mode = torch.tensor(0.0, device=device)
 
         # ★ Koopmanモードの時だけ追加Lossを計算
         if wandb.config.use_koopman_loss:
-            # ★マスク作成: パディング(network.N)以外の場所がTrue
-            # input_tokensの形状 [Batch, Seq]
             valid_mask = (input_tokens != network.N)
 
             # 2. Count Reconstruction (zの意味付け)
+            # 滞在数は「現在の場所」の属性なので、現在の状態 z_hat から予測します (変更なし)
             pred_count = model.count_decoder(z_hat).squeeze(-1)
             loss_count = masked_mse_loss(pred_count, stay_counts.float(), valid_mask)
 
             # 3. Multi-step Dynamics Loss (再帰予測)
-            K_steps = 5  # 何歩先まで予測するか
+            K_steps = 5
             
-            # t=0 から t=T-K までの z を初期状態とする
+            # 再帰予測の起点: Transformerが出力した z_hat
+            # 比較対象: 未来の z_hat
+            
+            # z_hat は [B, T, D]
+            # Kステップ先まで予測するため、末尾K個は起点にできない
             current_z = z_hat[:, :-K_steps, :]
             
-            # 再帰ループ
             for k in range(K_steps):
                 # 入力 u を取得 (t+k のタイミングのもの)
-                # u_all: [Batch, Seq, Dim]
-                # スライス: t=k から t=Seq-K+k まで
                 end_idx = -K_steps + k if (-K_steps + k) != 0 else None
                 u_curr_step = u_all[:, k : end_idx, :]
                 
-                # 線形遷移: z_{t+1} = A*z_t + B*u_t
+                # 線形遷移
                 term_A = torch.einsum("ij,btj->bti", model.A, current_z)
                 term_B = torch.einsum("ij,btj->bti", model.B, u_curr_step)
-                pred_z_next = term_A + term_B
+                pred_z_rec = term_A + term_B # recursive prediction
                 
-                # 正解データ (Transformerの出力) と比較
+                # 正解データ: (k+1)ステップ先の z_hat
                 start_true = k + 1
                 end_true = -K_steps + k + 1 if (-K_steps + k + 1) != 0 else None
                 true_z_next = z_hat[:, start_true : end_true, :]
                 
-                # ★マスクも未来に合わせてずらす
-                # 未来の時点がパディングなら、そこは学習しない
+                # マスク処理
                 future_mask = valid_mask[:, start_true : end_true]
                 
                 decay = 0.8 ** k
-                loss_dyn += masked_mse_loss(pred_z_next, true_z_next, future_mask) * decay
+                loss_dyn += masked_mse_loss(pred_z_rec, true_z_next, future_mask) * decay
                 
-                current_z = pred_z_next
+                current_z = pred_z_rec
 
-            # 4. Single-step Loss (念のため直近精度も担保)
-            z_true_next = z_hat[:, 1:, :] 
-            # z_pred_next は forward内で計算済み
-            # マスクは1つずらす
-            next_step_mask = valid_mask[:, 1:]
-            loss_k = masked_mse_loss(z_pred_next, z_true_next, next_step_mask)
+            # 4. Single-step Loss (Loss K)
+            # z_pred_next (モデル出力) は「t+1 の予測」
+            # z_hat (モデル出力) は「t の状態」
+            # よって、z_pred_next[t] と z_hat[t+1] を比較します。
+            
+            # z_pred_next の最後(予測先が系列外)は比較対象がないので捨てる [:, :-1]
+            z_pred_step = z_pred_next[:, :-1, :]
+            
+            # z_hat の最初(t=0)は予測対象ではないので捨てる [:, 1:]
+            z_true_step = z_hat[:, 1:, :] 
+            
+            # マスクもずらす
+            step_mask = valid_mask[:, 1:]
+            
+            loss_k = masked_mse_loss(z_pred_step, z_true_step, step_mask)
             
             # 5. モード損失
-            # 1. まず、すべてを「無視 (-100)」で初期化
-            target_modes = torch.full_like(target_tokens, -100)  # target_modes: [Batch, Seq]
-
-            # 2. Moveトークン (0 <= ID < 19) の場所を "1" に設定
+            target_modes = torch.full_like(target_tokens, -100)
             is_move = (target_tokens >= 0) & (target_tokens < network.N)
             target_modes[is_move] = 1
-
-            # 3. Stayトークン (19 <= ID < 38) の場所を "0" に設定
-            # STAY_OFFSET = 19, PAD_TOKEN = 38 (network.N * 2)
             STAY_OFFSET = network.N
             PAD_TOKEN = network.N * 2
             is_stay = (target_tokens >= STAY_OFFSET) & (target_tokens < PAD_TOKEN)
             target_modes[is_stay] = 0
 
-            # --- Loss計算 ---
-            # model.mode_classifier(z_hat) -> [Batch, Seq, 2]
-            pred_modes = model.mode_classifier(z_hat)
+            # ★変更: モード予測も「次の状態」である z_pred_next から行います
+            # target_modes は「次のトークン」の属性なので、これで整合します
+            pred_modes = model.mode_classifier(z_pred_next)
 
-            # 形状を合わせる: [Batch*Seq, 2] vs [Batch*Seq]
-            # ignore_index=-100 なので、パディング部分は自動的に無視され、
-            # Move(1)とStay(0)の部分だけが学習されます。
             loss_mode = nn.CrossEntropyLoss(ignore_index=-100)(
                 pred_modes.view(-1, 2), 
                 target_modes.view(-1)
             )
 
-            # 合計Loss
-            # 係数はタスクに応じて調整 (Alphaは重め、Count/Dynは補助的)
-            # ★★★ ここを変えたらvalidationの方も変える！！★★★
             loss_total = loss_ce + \
                         wandb.config.koopman_alpha * loss_k + \
                         0.01 * loss_count + \
-                        1 * loss_dyn + \
                         0.1 * loss_mode
+                        # 1 * loss_dyn + \
 
         optimizer.zero_grad()
         loss_total.backward()
@@ -501,6 +499,7 @@ for epoch in range(wandb.config.epochs):
 
 
 # --- Validation (ロジックはTrainと全く同じ) ---
+# --- Validation (ロジックはTrainと全く同じ) ---
     model.eval()
     epoch_metrics_val = {
         "loss": 0.0, "ce": 0.0, "dyn": 0.0, "linear": 0.0, "count": 0.0, "mode": 0.0
@@ -515,20 +514,22 @@ for epoch in range(wandb.config.epochs):
             target_tokens = tokenizer.tokenization(r_b, mode="next").long().to(device)
             stay_counts = tokenizer.calculate_stay_counts(input_tokens)
 
-            # input_tokens は [B, T] の形状 (先頭に<b>が入っている)
-            B_size, T = input_tokens.shape   # T がモデルが期待する Seq 長(=19など)
+            # input_tokens は [B, T] の形状
+            B_size, T = input_tokens.shape
+            
+            # Context Alignment (Trainと同様の関数定義が必要、または外で定義して呼ぶ)
             def align_ctx(ctx, target_len):
-                    # ctx: [B, L]
-                    # deviceは外部スコープのものを使用
-                    out = torch.zeros((B_size, target_len), dtype=torch.long, device=device)
-                    copy_len = min(ctx.shape[1], target_len - 1)
-                    if copy_len > 0:
-                        out[:, 1 : 1 + copy_len] = ctx[:, :copy_len]
-                    return out
+                out = torch.zeros((B_size, target_len), dtype=torch.long, device=device)
+                copy_len = min(ctx.shape[1], target_len - 1)
+                if copy_len > 0:
+                    out[:, 1 : 1 + copy_len] = ctx[:, :copy_len]
+                return out
+                
             h_in  = align_ctx(h_b,  T)
             tz_in = align_ctx(tz_b, T)
             e_in  = align_ctx(e_b,  T)
 
+            # ★変更点1: 戻り値に z_pred_next を追加
             logits, z_hat, z_pred_next, u_all = model(
                 tokens=input_tokens, 
                 stay_counts=stay_counts, 
@@ -536,44 +537,56 @@ for epoch in range(wandb.config.epochs):
                 holidays=h_in,
                 time_zones=tz_in,
                 events=e_in,
-                time_tensor=None # Unused
+                time_tensor=None 
             )
 
+            # CE Loss (logitsはz_pred_nextから生成されているのでそのまま比較)
             loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
             loss_total = loss_ce 
             
-            val_dyn = torch.tensor(0.0)
-            val_k = torch.tensor(0.0)
-            val_count = torch.tensor(0.0)
+            # 初期化
+            loss_dyn = torch.tensor(0.0, device=device)
+            loss_k = torch.tensor(0.0, device=device)
+            loss_count = torch.tensor(0.0, device=device)
+            loss_mode = torch.tensor(0.0, device=device)
 
             if wandb.config.use_koopman_loss:
                 valid_mask = (input_tokens != network.N)
                 
+                # Count Reconstruction (現在の状態 z_hat から予測)
                 pred_count = model.count_decoder(z_hat).squeeze(-1)
                 loss_count = masked_mse_loss(pred_count, stay_counts.float(), valid_mask)
 
-                loss_dyn = 0
+                # Multi-step Dynamics
+                # Trainと同じロジック
                 K_steps = 5
                 current_z = z_hat[:, :-K_steps, :]
                 for k in range(K_steps):
                     end_idx = -K_steps + k if (-K_steps + k) != 0 else None
                     u_curr_step = u_all[:, k : end_idx, :]
+                    
                     term_A = torch.einsum("ij,btj->bti", model.A, current_z)
                     term_B = torch.einsum("ij,btj->bti", model.B, u_curr_step)
-                    pred_z_next = term_A + term_B
+                    pred_z_rec = term_A + term_B
                     
                     start_true = k + 1
                     end_true = -K_steps + k + 1 if (-K_steps + k + 1) != 0 else None
                     true_z_next = z_hat[:, start_true : end_true, :]
                     
                     future_mask = valid_mask[:, start_true : end_true]
-                    loss_dyn += masked_mse_loss(pred_z_next, true_z_next, future_mask) * (0.8 ** k)
-                    current_z = pred_z_next
+                    loss_dyn += masked_mse_loss(pred_z_rec, true_z_next, future_mask) * (0.8 ** k)
+                    
+                    current_z = pred_z_rec
 
-                z_true_next = z_hat[:, 1:, :]
+                # ★変更点2: Single-step Linear Loss (Loss K) のスライス処理
+                # z_pred_next[t] (予測) vs z_hat[t+1] (正解)
+                z_pred_step = z_pred_next[:, :-1, :]
+                z_true_step = z_hat[:, 1:, :]
                 next_step_mask = valid_mask[:, 1:]
-                loss_k = masked_mse_loss(z_pred_next, z_true_next, next_step_mask)
+                
+                loss_k = masked_mse_loss(z_pred_step, z_true_step, next_step_mask)
             
+                # Mode Loss
                 target_modes = torch.full_like(target_tokens, -100)
                 is_move = (target_tokens >= 0) & (target_tokens < network.N)
                 target_modes[is_move] = 1
@@ -582,7 +595,9 @@ for epoch in range(wandb.config.epochs):
                 is_stay = (target_tokens >= STAY_OFFSET) & (target_tokens < PAD_TOKEN)
                 target_modes[is_stay] = 0
 
-                pred_modes = model.mode_classifier(z_hat)
+                # ★変更点3: z_hat ではなく z_pred_next (次の状態予測) を使う
+                pred_modes = model.mode_classifier(z_pred_next)
+                
                 loss_mode = nn.CrossEntropyLoss(ignore_index=-100)(
                     pred_modes.view(-1, 2), 
                     target_modes.view(-1)

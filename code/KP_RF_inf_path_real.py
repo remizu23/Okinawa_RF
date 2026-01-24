@@ -1,531 +1,697 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import pandas as pd
 import numpy as np
+import pandas as pd
 import networkx as nx
-import random
-import io
 import os
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages # ★追加: PDF出力用
+from matplotlib.backends.backend_pdf import PdfPages
 import Levenshtein
+from tqdm import tqdm
 from datetime import datetime
-
-# ★重要: 自作モデル定義ファイルのインポート
-try:
-    from KP_RF import KoopmanRoutesFormer
-except ImportError:
-    raise ImportError("KP_RF.py not found.")
+import sys
+from types import ModuleType
+from KP_RF import KoopmanRoutesFormer
+from network import Network, expand_adjacency_matrix
 
 # =========================================================
-# ★設定変更エリア
+# 1. Configuration
 # =========================================================
-# パディングトークン定義 (v3仕様)
-PAD_TOKEN = 38
-STAY_OFFSET = 19
-VOCAB_SIZE = 39 
+CONFIG = {
+    "gpu_id": 0,
+    "pad_token": 38,
+    "vocab_size": 42, 
+    "stay_offset": 19,
+    
+    # ★★★ 評価モード設定 ★★★
+    # "VAL_SPLIT": 学習用ファイルから検証データ(20%)を抽出して評価
+    # "TEST_FILE": テスト用ファイルを全件評価
+    "eval_mode": "VAL_SPLIT",  # <--- ここを変更してください ("VAL_SPLIT" or "TEST_FILE")
 
-# 入力データパス
-REAL_DATA_PATH = "/home/mizutani/projects/RF/data/input_e_test.npz"
+    # (A) "VAL_SPLIT" モード用のファイルパス (学習に使ったもの)
+    # "train_npz_path": "/home/mizutani/projects/RF/data/input_real_m4_emb.npz", 
+    "train_npz_path": "/home/mizutani/projects/RF/data/input_real_m5.npz", 
+    
+    # (B) "TEST_FILE" モード用のファイルパス (テスト専用)
+    "test_npz_path": "/home/mizutani/projects/RF/data/input_real_test_m4_emb.npz",
 
-# モデルパス
-MODEL_KOOPMAN_PATH = "/home/mizutani/projects/RF/runs/20260118_211219/model_weights_20260118_211219.pth"
-MODEL_NORMAL_PATH  = "/home/mizutani/projects/RF/runs/20260118_211856/model_weights_20260118_211856.pth"
+    # モデルパス
+    "model_koopman_path": "/home/mizutani/projects/RF/runs/20260124_195507/model_weights_20260124_195507.pth",
+    "model_ablation_path": "/home/mizutani/projects/RF/runs/20260124_171006/model_weights_20260124_171006.pth",
+    
+    # 出力設定
+    "output_dir": "/home/mizutani/projects/RF/runs/20260124_195507/eval_m5val",
+    "plot_max_samples": 1000,
 
-# =========================================================
-# ★ 地理的評価用設定 (2-hop対応版)
-# =========================================================
-ADJACENCY_MAP = {
-    0: [1, 2, 4, 11],
-    1: [0, 2, 4, 5, 9],
-    2: [0, 1, 5, 6, 7],
-    4: [0, 1, 5, 8, 9, 10, 11],
-    5: [1, 2, 4, 6, 10],
-    6: [2, 5, 7, 10, 14],
-    7: [2, 6, 13, 14, 15],
-    8: [4, 9, 11],
-    9: [1, 4, 8, 10, 12],
-    10: [4, 5, 6, 9, 12, 13],
-    11: [0, 4, 8],
-    12: [9, 10, 13],
-    13: [7, 10, 12, 14, 15],
-    14: [6, 7, 13, 15, 16],
-    15: [7, 13, 14],
-    16: [14, 17, 18],
-    17: [16, 18],
-    18: [16, 17]
+    # Context Logic
+    "holidays": [20240928, 20240929, 20251122, 20251123],
+    "night_start": 19, 
+    "night_end": 2,
+    "events": [
+        (20240929, 9, 16, [14]),
+        (20251122, 10, 19, [2, 11]),
+        (20251123, 10, 16, [2])
+    ],
 }
 
-# --- 距離行列の事前計算 (ここが重要) ---
+# 2-hop Adjacency Map
+ADJACENCY_MAP = {
+    0: [1, 2, 4, 11], 1: [0, 2, 4, 5, 9], 2: [0, 1, 5, 6, 7],
+    4: [0, 1, 5, 8, 9, 10, 11], 5: [1, 2, 4, 6, 10], 6: [2, 5, 7, 10, 14],
+    7: [2, 6, 13, 14, 15], 8: [4, 9, 11], 9: [1, 4, 8, 10, 12],
+    10: [4, 5, 6, 9, 12, 13], 11: [0, 4, 8], 12: [9, 10, 13],
+    13: [7, 10, 12, 14, 15], 14: [6, 7, 13, 15, 16], 15: [7, 13, 14],
+    16: [14, 17, 18], 17: [16, 18], 18: [16, 17]
+}
+
+# =========================================================
+# 2. Helper Functions
+# =========================================================
+# =========================================================
+# 追加: 滞在評価用ヘルパー関数
+# =========================================================
+def get_stay_events(seq, stay_offset=19, pad_token=38):
+    """
+    数列から滞在イベントを抽出する
+    Returns: list of dict {'start': int, 'end': int, 'node': int, 'dur': int}
+    """
+    events = []
+    n = len(seq)
+    i = 0
+    while i < n:
+        token = seq[i]
+        # 定義A: トークンIDが stay_offset(19)以上 pad_token(38)未満なら滞在
+        if stay_offset <= token < pad_token:
+            start = i
+            node_id = token - stay_offset
+            # 同じ滞在トークンが続く限りループ
+            while i < n and seq[i] == token:
+                i += 1
+            end = i # endはexclusive
+            duration = end - start
+            events.append({
+                'start': start,
+                'end': end,
+                'node': node_id,
+                'dur': duration
+            })
+        else:
+            i += 1
+    return events
+
+def calc_stay_metrics_pair(gt_seq, pred_seq, node_dists):
+    """
+    GTと予測の滞在イベントをマッチングし、指標を計算する (定義B & C)
+    """
+    gt_events = get_stay_events(gt_seq)
+    pred_events = get_stay_events(pred_seq)
+    
+    results = []
+    
+    # GTの各滞在に対して、予測側で重複しているものを探す
+    for gt_e in gt_events:
+        best_match = None
+        max_overlap = 0
+        
+        for pred_e in pred_events:
+            # 時間的重複 (Overlap) の計算
+            overlap_start = max(gt_e['start'], pred_e['start'])
+            overlap_end = min(gt_e['end'], pred_e['end'])
+            overlap = max(0, overlap_end - overlap_start)
+            
+            if overlap > 0:
+                # 最も長く重複しているものを採用
+                if overlap > max_overlap:
+                    max_overlap = overlap
+                    best_match = pred_e
+        
+        # マッチ結果の記録
+        metric = {
+            'detected': False,
+            'len_diff': None,    # 定義C: Pred - GT
+            'loc_dist': None,    # 地理的距離 (Hop数)
+            'gt_dur': gt_e['dur'],
+            'gt_node': gt_e['node']
+        }
+        
+        if best_match:
+            metric['detected'] = True
+            metric['len_diff'] = best_match['dur'] - gt_e['dur'] # 数値(差分)
+            
+            # 場所の距離計算 (NODE_DISTANCESを使用)
+            u, v = gt_e['node'], best_match['node']
+            if u == v:
+                dist = 0
+            elif u in node_dists and v in node_dists[u]:
+                dist = node_dists[u][v]
+            else:
+                # 辞書にない場合は最大ペナルティまたは遠方扱い(便宜上10とするかinf)
+                dist = 999 
+            metric['loc_dist'] = dist
+        else:
+            # 検出できなかった場合 (見逃し)
+            # 差分は「完全に短かった」として扱うなら -gt_dur ですが、
+            # ここでは集計時に区別できるよう None または 特殊値を推奨
+            metric['len_diff'] = -gt_e['dur'] # 0 - GT = 負の値
+            metric['loc_dist'] = None       # 場所は評価不能
+            
+        results.append(metric)
+        
+    return results
+    
 def build_distance_matrix(adj_map):
     G = nx.Graph()
     for u, neighbors in adj_map.items():
         for v in neighbors:
             G.add_edge(u, v)
-    
-    # 全ノード間の最短ホップ数を計算 (辞書の辞書形式)
-    # dists[0][4] = 1, dists[0][9] = 2 ... のようにアクセス可能
-    dists = dict(nx.all_pairs_shortest_path_length(G))
-    return dists
+    return dict(nx.all_pairs_shortest_path_length(G))
 
-# グローバル変数として保持
 NODE_DISTANCES = build_distance_matrix(ADJACENCY_MAP)
 
-
 def get_node_id(token):
-    """トークンID(Move/Stay)を純粋なノードID(0-18)に変換"""
-    if token == PAD_TOKEN:
-        return -1
-    if token >= STAY_OFFSET:
-        return token - STAY_OFFSET
-    return token
+    if token == CONFIG["pad_token"]: return -1
+    if token >= CONFIG["stay_offset"] and token < CONFIG["pad_token"]:
+        return token - CONFIG["stay_offset"]
+    if token < CONFIG["stay_offset"]:
+        return token
+    return -1
 
 def get_geo_cost(t1, t2):
-    """
-    地理的コスト関数 (距離に応じた可変ペナルティ)
-    """
-    if t1 == t2:
-        return 0.0
-    
-    n1 = get_node_id(t1)
-    n2 = get_node_id(t2)
-    
-    # パディング等は最大ペナルティ
-    if n1 == -1 or n2 == -1:
-        return 1.0
-    
-    # 場所が同じならコスト0 (Move/Stayの違いを許容)
-    if n1 == n2:
-        return 0.0
-    
-    # 距離テーブルからホップ数を取得
-    # ノードがつながっていない場合(到達不能)は最大ペナルティ
+    n1, n2 = get_node_id(t1), get_node_id(t2)
+    if n1 == -1 or n2 == -1: return 1.0
+    if n1 == n2: return 0.0
     try:
         dist = NODE_DISTANCES[n1][n2]
     except KeyError:
-        return 1.0 
+        return 1.0
+    if dist == 1: return 0.3
+    elif dist == 2: return 0.6
+    else: return 1.0
 
-    # --- ★距離に応じたコスト設定エリア★ ---
-    if dist == 1:
-        return 0.3  # 1つ隣 (Neighbour)
-    elif dist == 2:
-        return 0.6  # 2つ隣 (Near)
-    else:
-        return 1.0  # それ以上遠い (Far)
-
-
-# =========================================================
-# 0. 保存先設定
-# =========================================================
-run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_dir = f"/home/mizutani/projects/RF/runs/eval_real_pdf_{run_id}"
-os.makedirs(out_dir, exist_ok=True)
-
-print(f"=== Evaluation Started: {run_id} ===")
-def save_log(msg):
-    print(msg)
-    with open(os.path.join(out_dir, "evaluation_log.txt"), "a") as f:
-        f.write(msg + "\n")
-
-
-
-# =========================================================
-# 1. データ読み込み関数
-# =========================================================
-def load_real_test_data(npz_path):
-    save_log(f"Loading real test data from {npz_path}...")
-    if not os.path.exists(npz_path):
-        save_log(f"Error: File {npz_path} not found.")
-        return []
-
-    try:
-        data = np.load(npz_path)
-        route_arr = data['route_arr'] 
-    except Exception as e:
-        save_log(f"Error loading npz: {e}")
-        return []
-
-    test_data = []
-    for i, seq in enumerate(route_arr):
-        valid_traj = [int(x) for x in seq if x != PAD_TOKEN]
-        test_data.append({
-            'agent_id': i,
-            'type': 'real',
-            'trajectory': valid_traj
-        })
+class ContextDeterminer:
+    def __init__(self, config):
+        self.config = config
     
-    save_log(f"Loaded {len(test_data)} trajectories.")
-    return test_data
+    def get_holiday(self, timestamp_int):
+        date_int = timestamp_int // 10000
+        return 1 if date_int in self.config["holidays"] else 0
+
+    def get_timezone(self, timestamp_int):
+        hour = (timestamp_int // 100) % 100
+        if hour >= self.config["night_start"] or hour < self.config["night_end"]:
+            return 1
+        return 0
+
+    def get_event(self, timestamp_int, current_token):
+        current_node = get_node_id(current_token)
+        if current_node == -1: return 0
+        date_int = timestamp_int // 10000
+        hour = (timestamp_int // 100) % 100
+        for (e_date, s_h, e_h, nodes) in self.config["events"]:
+            if date_int == e_date:
+                if s_h <= hour < e_h:
+                    if current_node in nodes:
+                        return 1
+        return 0
 
 # =========================================================
-# 2. モデルロード関数
+# 3. Evaluator Class
 # =========================================================
-def load_model(model_path, device):
-    save_log(f"Loading model from: {model_path}")
-    checkpoint = torch.load(model_path, map_location=device)
+class ModelEvaluator:
+    def __init__(self, model, device, context_logic, is_koopman=True):
+        self.model = model
+        self.device = device
+        self.context_logic = context_logic
+        self.is_koopman = is_koopman
+        self.model.eval()
 
-    default_config = {
-        'vocab_size': VOCAB_SIZE, 
-        'token_emb_dim': 64, 'd_model': 64, 'nhead': 4, 
-        'num_layers': 6, 'd_ff': 128, 'z_dim': 16, 
-        'pad_token_id': PAD_TOKEN
-    }
-    
-    if 'config' in checkpoint:
-        config = checkpoint['config']
+    def calculate_stay_counts(self, tokens):
+        b, t = tokens.shape
+        out = torch.zeros_like(tokens)
+        tokens_np = tokens.cpu().numpy()
+        pad_id = CONFIG["pad_token"]
+        special_ids = [pad_id, pad_id+1, pad_id+2, pad_id+3]
+        for i in range(b):
+            cnt = 0
+            curr = -1
+            for j in range(t):
+                val = tokens_np[i, j]
+                if val in special_ids:
+                    cnt = 0; curr = -1
+                else:
+                    if val == curr: cnt += 1
+                    else: cnt = 1; curr = val
+                out[i, j] = cnt
+        return out.to(self.device)
+
+    def get_embeddings(self, token, stay_count, agent_id, holiday, timezone, event):
+        token_t = torch.tensor([[token]], device=self.device)
+        stay_t  = torch.tensor([[stay_count]], device=self.device)
+        agent_t = torch.tensor([agent_id], device=self.device).unsqueeze(0)
+        hol_t   = torch.tensor([[holiday]], device=self.device)
+        tz_t    = torch.tensor([[timezone]], device=self.device)
+        evt_t   = torch.tensor([[event]], device=self.device)
+        u_vec = torch.cat([
+            self.model.token_embedding(token_t),
+            self.model.stay_embedding(stay_t),
+            self.model.agent_embedding(agent_t),
+            self.model.holiday_embedding(hol_t),
+            self.model.time_zone_embedding(tz_t),
+            self.model.event_embedding(evt_t)
+        ], dim=-1)
+        return u_vec
+
+    def predict_next_step_metrics(self, prompt_seq, prompt_contexts, target_token):
+        tokens = torch.tensor([prompt_seq], dtype=torch.long, device=self.device)
+        h_b = torch.tensor([prompt_contexts['h']], dtype=torch.long, device=self.device)
+        tz_b = torch.tensor([prompt_contexts['tz']], dtype=torch.long, device=self.device)
+        e_b = torch.tensor([prompt_contexts['e']], dtype=torch.long, device=self.device)
+        stay_counts = self.calculate_stay_counts(tokens)
+        
+        a_val = prompt_contexts['agent']
+        num_agents_model = self.model.agent_embedding.num_embeddings
+        a_val = a_val % num_agents_model 
+        agent_id = torch.tensor([a_val], dtype=torch.long, device=self.device)
+
+        with torch.no_grad():
+            logits, _, _, _ = self.model(
+                tokens, stay_counts, agent_id, h_b, tz_b, e_b
+            )
+        
+        last_logits = logits[0, -1, :]
+        probs = F.softmax(last_logits, dim=0)
+        pred_token = torch.argmax(probs).item()
+        
+        is_correct = (pred_token == target_token)
+        likelihood = probs[target_token].item()
+        return is_correct, likelihood
+
+    def generate_trajectory(self, prompt_seq, start_time, agent_id_raw, gen_len):
+        h_val = self.context_logic.get_holiday(start_time)
+        tz_val = self.context_logic.get_timezone(start_time)
+        
+        prompt_h = [h_val] * len(prompt_seq)
+        prompt_tz = [tz_val] * len(prompt_seq)
+        prompt_e = [self.context_logic.get_event(start_time, t) for t in prompt_seq]
+        
+        tokens_in = torch.tensor([prompt_seq], dtype=torch.long, device=self.device)
+        h_in = torch.tensor([prompt_h], dtype=torch.long, device=self.device)
+        tz_in = torch.tensor([prompt_tz], dtype=torch.long, device=self.device)
+        e_in = torch.tensor([prompt_e], dtype=torch.long, device=self.device)
+        stay_counts_in = self.calculate_stay_counts(tokens_in)
+
+        num_agents_model = self.model.agent_embedding.num_embeddings
+        safe_agent_id = agent_id_raw % num_agents_model
+        agent_in = torch.tensor([safe_agent_id], dtype=torch.long, device=self.device)
+        
+        generated_seq = []
+        
+        with torch.no_grad():
+            logits, z_hat_seq, _, _ = self.model(
+                tokens_in, stay_counts_in, agent_in, h_in, tz_in, e_in
+            )
+            
+            if self.is_koopman:
+                z_curr = z_hat_seq[:, -1, :]
+                current_token = prompt_seq[-1]
+                current_stay_count = stay_counts_in[0, -1].item()
+                
+                for _ in range(gen_len):
+                    e_val = self.context_logic.get_event(start_time, current_token)
+                    u_t = self.get_embeddings(
+                        current_token, current_stay_count, safe_agent_id,
+                        h_val, tz_val, e_val
+                    ).squeeze(1)
+                    
+                    term_A = torch.matmul(z_curr, self.model.A.t())
+                    term_B = torch.matmul(u_t, self.model.B.t())
+                    z_next = term_A + term_B
+                    
+                    logits_next = self.model.to_logits(z_next)
+                    next_token = torch.argmax(logits_next, dim=-1).item()
+                    generated_seq.append(next_token)
+                    
+                    if next_token == current_token:
+                        current_stay_count += 1
+                        if current_stay_count >= self.model.stay_embedding.num_embeddings:
+                            current_stay_count = self.model.stay_embedding.num_embeddings - 1
+                    else:
+                        current_stay_count = 1
+                    current_token = next_token
+                    z_curr = z_next
+            else:
+                curr_seq = tokens_in
+                curr_h = h_in
+                curr_tz = tz_in
+                curr_e = e_in
+                curr_stay = stay_counts_in
+                
+                for _ in range(gen_len):
+                    logits, _, _, _ = self.model(
+                        curr_seq, curr_stay, agent_in, curr_h, curr_tz, curr_e
+                    )
+                    next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
+                    generated_seq.append(next_token)
+                    
+                    next_tens = torch.tensor([[next_token]], device=self.device)
+                    curr_seq = torch.cat([curr_seq, next_tens], dim=1)
+                    
+                    e_val = self.context_logic.get_event(start_time, next_token)
+                    curr_h = torch.cat([curr_h, torch.tensor([[h_val]], device=self.device)], dim=1)
+                    curr_tz = torch.cat([curr_tz, torch.tensor([[tz_val]], device=self.device)], dim=1)
+                    curr_e = torch.cat([curr_e, torch.tensor([[e_val]], device=self.device)], dim=1)
+                    curr_stay = self.calculate_stay_counts(curr_seq)
+        return generated_seq
+
+def calc_dtw(seq1, seq2, geo=False):
+    n, m = len(seq1), len(seq2)
+    dtw = np.full((n + 1, m + 1), float('inf'))
+    dtw[0, 0] = 0
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if geo: cost = get_geo_cost(seq1[i-1], seq2[j-1])
+            else: cost = 0.0 if seq1[i-1] == seq2[j-1] else 1.0
+            dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
+    return dtw[n, m]
+
+def calc_levenshtein(seq1, seq2, geo=False):
+    if not geo:
+        s1 = "".join([chr(x+100) for x in seq1])
+        s2 = "".join([chr(x+100) for x in seq2])
+        return Levenshtein.distance(s1, s2)
     else:
-        config = default_config
+        n, m = len(seq1), len(seq2)
+        dp = np.zeros((n + 1, m + 1))
+        for i in range(n + 1): dp[i, 0] = i
+        for j in range(m + 1): dp[0, j] = j
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                sub_cost = get_geo_cost(seq1[i-1], seq2[j-1])
+                dp[i, j] = min(dp[i-1, j]+1, dp[i, j-1]+1, dp[i-1, j-1]+sub_cost)
+        return dp[n, m]
+
+# =========================================================
+# 5. Main Execution
+# =========================================================
+def load_weights(path, device, is_koopman):
+    checkpoint = torch.load(path, map_location=device)
+    conf = checkpoint['config']
+    state_dict = checkpoint['model_state_dict']
+    
+    if 'agent_embedding.weight' in state_dict:
+        detected_num_agents = state_dict['agent_embedding.weight'].shape[0]
+        print(f"[{os.path.basename(path)}] Detected num_agents: {detected_num_agents}")
+    else:
+        detected_num_agents = 1
+        print(f"[{os.path.basename(path)}] Agent embedding not found, using default: 1")
 
     model = KoopmanRoutesFormer(
-        vocab_size=config.get('vocab_size', VOCAB_SIZE),
-        token_emb_dim=config['token_emb_dim'],
-        d_model=config['d_model'],
-        nhead=config['nhead'],
-        num_layers=config['num_layers'],
-        d_ff=config['d_ff'],
-        z_dim=config['z_dim'],
-        pad_token_id=config.get('pad_token_id', PAD_TOKEN),
-        num_agents=config.get('num_agents', 1),
-        agent_emb_dim=config.get('agent_emb_dim', 16),
-        max_stay_count=config.get('max_stay_count', 500),
-        stay_emb_dim=config.get('stay_emb_dim', 16)
+        vocab_size=conf.get('vocab_size', CONFIG["vocab_size"]),
+        token_emb_dim=conf['token_emb_dim'],
+        d_model=conf['d_model'],
+        nhead=conf['nhead'],
+        num_layers=conf['num_layers'],
+        d_ff=conf['d_ff'],
+        z_dim=conf['z_dim'],
+        pad_token_id=conf.get('pad_token_id', CONFIG["pad_token"]),
+        num_agents=detected_num_agents, 
+        agent_emb_dim=conf.get('agent_emb_dim', 16),
+        stay_emb_dim=conf.get('stay_emb_dim', 16),
+        holiday_emb_dim=conf.get('holiday_emb_dim', 4),
+        time_zone_emb_dim=conf.get('time_zone_emb_dim', 4),
+        event_emb_dim=conf.get('event_emb_dim', 4),
+        dist_mat_base=None 
     )
-    
-    model.has_extra_inputs = ('agent_emb_dim' in config) or (hasattr(model, 'agent_embedding'))
-
-    try:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    except RuntimeError as e:
-        save_log(f"Critical Error in load_state_dict: {e}")
-        raise e    
+    model.load_state_dict(state_dict, strict=False)
     model.to(device)
-    model.eval()
-    return model, config
+    return model
 
-# =========================================================
-# 3. 推論 & 評価
-# =========================================================
-def calculate_stay_counts_seq(seq):
-    counts = []
-    current_val = -1
-    counter = 0
-    for val in seq:
-        if val == current_val:
-            counter += 1
+def main():
+    os.makedirs(CONFIG["output_dir"], exist_ok=True)
+    device = torch.device(f"cuda:{CONFIG['gpu_id']}" if torch.cuda.is_available() else "cpu")
+    print(f"Evaluation Started: {CONFIG['output_dir']}")
+    print(f"Mode: {CONFIG['eval_mode']}")
+    print(f"Using Device: {device}")
+
+    # =====================================================
+    # 1. Data Loading Switch Logic
+    # =====================================================
+    route_arr, time_arr, agent_ids = None, None, None
+    
+    if CONFIG["eval_mode"] == "TEST_FILE":
+        # (A) テスト用ファイルを直接使用
+        dpath = CONFIG["test_npz_path"]
+        print(f"Loading TEST file: {dpath}")
+        if not os.path.exists(dpath):
+            print(f"Error: File not found {dpath}")
+            return
+        
+        data = np.load(dpath)
+        route_arr = data['route_arr']
+        time_arr = data['time_arr']
+        if 'agent_ids' in data:
+            agent_ids = data['agent_ids']
         else:
-            counter = 1
-            current_val = val
-        counts.append(counter)
-    return counts
-
-def predict_trajectory(model, initial_seq, predict_len, agent_id, device):
-    model.eval()
-    current_seq = initial_seq.copy()
-    needs_extra = getattr(model, 'has_extra_inputs', False)
-    
-    with torch.no_grad():
-        for _ in range(predict_len):
-            input_tensor = torch.tensor([current_seq], dtype=torch.long).to(device)
+            agent_ids = np.zeros(len(route_arr), dtype=int)
             
-            if needs_extra:
-                current_counts = calculate_stay_counts_seq(current_seq)
-                stay_tensor = torch.tensor([current_counts], dtype=torch.long).to(device)
-                safe_agent_id = agent_id % model.agent_embedding.num_embeddings 
-                agent_tensor = torch.tensor([safe_agent_id], dtype=torch.long).to(device)
-                output = model(input_tensor, stay_tensor, agent_tensor)
-            else:
-                output = model(input_tensor)
-            
-            if isinstance(output, tuple):
-                logits = output[0]
-            else:
-                logits = output
-            
-            last_timestep_logits = logits[0, -1, :]
-            next_token = torch.argmax(last_timestep_logits).item()
-            current_seq.append(next_token)
-            
-    generated_future = current_seq[len(initial_seq):]
-    return generated_future
-
-def calc_dtw(seq1, seq2):
-    n, m = len(seq1), len(seq2)
-    dtw = [[float('inf')] * (m + 1) for _ in range(n + 1)]
-    dtw[0][0] = 0
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = 0 if seq1[i-1] == seq2[j-1] else 1
-            dtw[i][j] = cost + min(dtw[i-1][j], dtw[i][j-1], dtw[i-1][j-1])
-    return dtw[n][m]
-
-
-
-def calc_geo_dtw(seq1, seq2):
-    """地理的隣接を考慮したDTW (Geo-DTW)"""
-    n, m = len(seq1), len(seq2)
-    # DPテーブル初期化
-    dtw = [[float('inf')] * (m + 1) for _ in range(n + 1)]
-    dtw[0][0] = 0
-    
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            # コスト計算部分だけ変更
-            cost = get_geo_cost(seq1[i-1], seq2[j-1])
-            
-            # 累積コスト更新
-            dtw[i][j] = cost + min(dtw[i-1][j],    # 挿入
-                                   dtw[i][j-1],    # 削除
-                                   dtw[i-1][j-1])  # マッチ/置換
-            
-    return dtw[n][m]
-
-
-def calc_weighted_levenshtein(seq1, seq2):
-    """地理的隣接を考慮した重み付き編集距離"""
-    n, m = len(seq1), len(seq2)
-    # DPテーブル (現在の列と1つ前の列だけ持つことでメモリ節約も可能だが、わかりやすく2次元で)
-    dp = [[0.0] * (m + 1) for _ in range(n + 1)]
-    
-    # 初期化 (挿入・削除コストは1.0固定とする)
-    for i in range(n + 1): dp[i][0] = float(i)
-    for j in range(m + 1): dp[0][j] = float(j)
-    
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            subst_cost = get_geo_cost(seq1[i-1], seq2[j-1])
-            
-            dp[i][j] = min(
-                dp[i-1][j] + 1.0,        # 削除
-                dp[i][j-1] + 1.0,        # 挿入
-                dp[i-1][j-1] + subst_cost # 置換
-            )
-    return dp[n][m]
-
-
-def evaluate_models(model_koopman, model_normal, test_data, prompt_len=15, device='cuda'):
-    results = []
-    print(f"Evaluating on {len(test_data)} test trajectories...")
-    to_str = lambda seq: "".join([chr(x + 48) for x in seq]) 
-    
-    MIN_TRAJ_LEN = prompt_len + 5
-
-    for i, data in enumerate(test_data):
-        full_traj = data['trajectory']
-        agent_id = data['agent_id']
-
-        total_len = len(full_traj)
-        if total_len <= MIN_TRAJ_LEN: continue
-            
-        prompt_seq = full_traj[:prompt_len]
-        gt_future = full_traj[prompt_len:]
-        pred_len = len(gt_future)
+        print(f"Loaded {len(route_arr)} test samples.")
         
-        # 推論
-        pred_k_future = predict_trajectory(model_koopman, prompt_seq, pred_len, agent_id, device)
-        pred_n_future = predict_trajectory(model_normal, prompt_seq, pred_len, agent_id, device)
-        
-        # --- 既存指標 (Levenshtein, DTW) ---
-        dist_k_lev = Levenshtein.distance(to_str(gt_future), to_str(pred_k_future))
-        dist_n_lev = Levenshtein.distance(to_str(gt_future), to_str(pred_n_future))
-        
-        dist_k_dtw = calc_dtw(gt_future, pred_k_future)
-        dist_n_dtw = calc_dtw(gt_future, pred_n_future)
-
-        # --- ★追加: 地理的評価指標 (Geo-DTW, Geo-Lev) ---
-        geo_k_dtw = calc_geo_dtw(gt_future, pred_k_future)
-        geo_n_dtw = calc_geo_dtw(gt_future, pred_n_future)
-        
-        geo_k_lev = calc_weighted_levenshtein(gt_future, pred_k_future)
-        geo_n_lev = calc_weighted_levenshtein(gt_future, pred_n_future)
-
-        results.append({
-            'id': agent_id,
-            'type': data['type'],
-            'total_len': total_len,
-            # Normal scores
-            'score_k_lev': dist_k_lev / pred_len, 
-            'score_n_lev': dist_n_lev / pred_len,
-            'score_k_dtw': dist_k_dtw / pred_len,
-            'score_n_dtw': dist_n_dtw / pred_len,
-            'geo_k_dtw': geo_k_dtw / pred_len,
-            'geo_n_dtw': geo_n_dtw / pred_len,
-            'geo_k_lev': geo_k_lev / pred_len,
-            'geo_n_lev': geo_n_lev / pred_len,
+    elif CONFIG["eval_mode"] == "VAL_SPLIT":
+        # (B) 学習用ファイルからValidation Splitを再現
+        dpath = CONFIG["train_npz_path"]
+        print(f"Loading TRAIN file for validation split: {dpath}")
+        if not os.path.exists(dpath):
+            print(f"Error: File not found {dpath}")
+            return
             
-            'prompt': prompt_seq,
-            'gt': gt_future,
-            'pred_k': pred_k_future,
-            'pred_n': pred_n_future
-        })
-        
-        if (i+1) % 10 == 0:
-            print(f"Processed {i+1}/{len(test_data)}...", end='\r')
+        data = np.load(dpath)
+        route_arr_full = data['route_arr']
+        time_arr_full = data['time_arr']
+        if 'agent_ids' in data:
+            agent_ids_full = data['agent_ids']
+        else:
+            agent_ids_full = np.zeros(len(route_arr_full), dtype=int)
             
-    return pd.DataFrame(results)
-
-
-# =========================================================
-# 4. 可視化ロジック (★修正: PDF一括出力)
-# =========================================================
-def decode_for_plot(seq):
-    arr = np.array(seq, dtype=float)
-    is_stay = (arr >= STAY_OFFSET) & (arr < PAD_TOKEN)
-    arr[is_stay] -= STAY_OFFSET
-    arr[arr == PAD_TOKEN] = np.nan
-    return arr
-
-def save_all_plots_to_pdf(df_res, out_path):
-    """
-    データフレーム内の全結果をPDFにプロットする関数
-    - 1ページあたり20枚 (5行x4列)
-    - 各図にED, DTWスコアを明記
-    """
-    if df_res.empty:
-        print("No results to plot.")
+        # チェックポイントからインデックスを取得
+        print(f"Retrieving validation indices from checkpoint...")
+        checkpoint = torch.load(CONFIG["model_koopman_path"], map_location=device)
+        if "val_indices" not in checkpoint:
+            print("Error: 'val_indices' not found in checkpoint.")
+            return
+        
+        val_indices = checkpoint["val_indices"]
+        if isinstance(val_indices, torch.Tensor):
+            val_indices = val_indices.cpu().numpy()
+            
+        route_arr = route_arr_full[val_indices]
+        time_arr = time_arr_full[val_indices]
+        agent_ids = agent_ids_full[val_indices]
+        
+        print(f"Extracted {len(route_arr)} validation samples.")
+        
+    else:
+        print(f"Error: Unknown eval_mode {CONFIG['eval_mode']}")
         return
 
-    print(f"Plotting {len(df_res)} trajectories to PDF...")
-    
-    # PDF設定
-    pdf = PdfPages(out_path)
-    
-    # ページ設定 (A4縦想定で適当なサイズに)
-    ROWS = 5
-    COLS = 4
-    PLOTS_PER_PAGE = ROWS * COLS
-    FIG_SIZE = (20, 25) # 大きめに確保
-    
-    # 全データをイテレート
-    num_samples = len(df_res)
-    num_pages = (num_samples + PLOTS_PER_PAGE - 1) // PLOTS_PER_PAGE
-    
-    for page in range(num_pages):
-        fig, axes = plt.subplots(ROWS, COLS, figsize=FIG_SIZE)
-        # axesを1次元配列にして扱いやすくする (1行の場合は例外処理が必要だが5行あるのでOK)
-        axes = axes.flatten()
-        
-        start_idx = page * PLOTS_PER_PAGE
-        end_idx = min((page + 1) * PLOTS_PER_PAGE, num_samples)
-        
-        # このページのデータを描画
-        for i in range(PLOTS_PER_PAGE):
-            curr_idx = start_idx + i
-            ax = axes[i]
-            
-            if curr_idx < num_samples:
-                row = df_res.iloc[curr_idx]
-                _plot_on_axis(ax, row)
-            else:
-                # データがないマスは非表示
-                ax.axis('off')
-        
-        plt.tight_layout()
-        pdf.savefig(fig)
-        plt.close(fig)
-        print(f"Saved page {page+1}/{num_pages}", end='\r')
-        
-    pdf.close()
-    print(f"\nPDF saved successfully: {out_path}")
-
-def _plot_on_axis(ax, row):
-    """
-    個別のAxesに描画するヘルパー関数
-    """
-    prompt_len = len(row['prompt'])
-    
-    # データの結合とデコード
-    full_gt = decode_for_plot(row['prompt'] + row['gt'])
-    full_k  = decode_for_plot(row['prompt'] + row['pred_k'])
-    full_n  = decode_for_plot(row['prompt'] + row['pred_n'])
-    
-    # Ground Truth
-    ax.plot(full_gt, label='GT', color='black', linewidth=2.5, alpha=0.3)
-    ax.axvline(x=prompt_len-0.5, color='gray', linestyle='--', linewidth=0.8)
-    
-    # Predictions
-    x_range = range(prompt_len, len(full_gt))
-    # 長さ調整
-    len_k = min(len(x_range), len(full_k[prompt_len:]))
-    len_n = min(len(x_range), len(full_n[prompt_len:]))
-    
-    # Koopman
-    ax.plot(list(x_range)[:len_k], full_k[prompt_len:][:len_k], 
-            label='Koopman', color='red', linewidth=1.2)
-    
-    # Normal
-    ax.plot(list(x_range)[:len_n], full_n[prompt_len:][:len_n], 
-            label='Normal', color='blue', linestyle=':', linewidth=1.2)
-    
-    # タイトル作成 (スコア表示)
-    # K: Koopman, N: Normal, E: ED(Levenshtein), D: DTW
-    title_str = (f"ID:{row['id']} Len:{row['total_len']}\n"
-                 f"K [ED:{row['score_k_lev']:.2f}, DTW:{row['score_k_dtw']:.2f}, geoED:{row['geo_k_lev']:.2f}, geoDTW:{row['geo_k_dtw']:.2f}]\n"
-                 f"N [ED:{row['score_n_lev']:.2f}, DTW:{row['score_n_dtw']:.2f}, geoED:{row['geo_n_lev']:.2f}, geoDTW:{row['geo_n_dtw']:.2f}]")
-    
-    ax.set_title(title_str, fontsize=9)
-    ax.set_yticks(range(0, 19, 2)) # 目盛りを少し間引く
-    ax.tick_params(axis='both', which='major', labelsize=8)
-    ax.grid(True, alpha=0.3)
-    
-    # 凡例は小さく表示 (最初のプロットだけ、あるいは全部につけるか。全部につける)
-    ax.legend(fontsize=7, loc='upper left')
-
-
-# =========================================================
-# Main
-# =========================================================
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 1. モデルロード
+    # =====================================================
+    # 2. Model & Evaluator Setup
+    # =====================================================
     try:
-        model_koopman, _ = load_model(MODEL_KOOPMAN_PATH, device)
-        model_normal, _ = load_model(MODEL_NORMAL_PATH, device)
+        model_koopman = load_weights(CONFIG["model_koopman_path"], device, is_koopman=True)
+        model_ablation = load_weights(CONFIG["model_ablation_path"], device, is_koopman=False)
     except Exception as e:
-        save_log(f"Model Load Error: {e}")
-        # exit() 
-        
-    # 2. 実データ読み込み
-    gt_data = load_real_test_data(REAL_DATA_PATH)
-    
-    # 3. 評価
-    if gt_data:
-        # prompt_len=15で評価
-        df_res = evaluate_models(model_koopman, model_normal, gt_data, prompt_len=15, device=device)
-        
-        # グループ分けロジック
-        def classify_length(l):
-            if 30 <= l <= 60:
-                return "Medium (30-60)"
-            elif l > 60:
-                return "Long (>60)"
-            else:
-                return "Short (<30)"
+        print(f"Model Load Error: {e}")
+        return
 
-        df_res['len_group'] = df_res['total_len'].apply(classify_length)
+    ctx_logic = ContextDeterminer(CONFIG)
+    eval_k = ModelEvaluator(model_koopman, device, ctx_logic, is_koopman=True)
+    eval_a = ModelEvaluator(model_ablation, device, ctx_logic, is_koopman=False)
+    
+    metrics_list = []
+    test_indices = range(len(route_arr))
+    prompt_len = 5
+    
+    # =====================================================
+    # 3. Evaluation Loop
+    # =====================================================
+    print("Running evaluation loop...")
+    for idx in tqdm(test_indices):
+        full_seq = [int(x) for x in route_arr[idx] if x != CONFIG["pad_token"]]
         
-        # CSV保存
-        csv_path = os.path.join(out_dir, "evaluation_results.csv")
-        df_res.to_csv(csv_path, index=False)
+        if len(full_seq) <= prompt_len + 3: 
+            continue
+            
+        start_time = int(time_arr[idx])
+        agent_id = int(agent_ids[idx])
         
-        # 全体平均ログ
-        save_log("\n=== Overall Scores (Lower is Better) ===")
-        save_log("Levenshtein (Norm):")
-        save_log(df_res[['score_k_lev', 'score_n_lev']].mean().to_string())
-        save_log("DTW (Norm):")
-        save_log(df_res[['score_k_dtw', 'score_n_dtw']].mean().to_string())
+        prompt_seq = full_seq[:prompt_len]
+        gt_future = full_seq[prompt_len:]
         
-        # 全体平均ログ (追加)
-        save_log("Geo-Lev (Norm) [Lower is Better, Neighbor Bonus]:")
-        save_log(df_res[['geo_k_lev', 'geo_n_lev']].mean().to_string())
-        save_log("Geo-DTW (Norm) [Lower is Better, Neighbor Bonus]:")
-        save_log(df_res[['geo_k_dtw', 'geo_n_dtw']].mean().to_string())
+        # Task 1
+        prompt_ctx = {
+            'h': [ctx_logic.get_holiday(start_time)] * prompt_len,
+            'tz': [ctx_logic.get_timezone(start_time)] * prompt_len,
+            'e': [ctx_logic.get_event(start_time, t) for t in prompt_seq],
+            'agent': agent_id
+        }
+        target_token = gt_future[0]
         
-        # ★PDF一括出力 (変更箇所)
-        pdf_path = os.path.join(out_dir, "all_trajectories.pdf")
-        save_all_plots_to_pdf(df_res, pdf_path)
+        acc_k, like_k = eval_k.predict_next_step_metrics(prompt_seq, prompt_ctx, target_token)
+        acc_a, like_a = eval_a.predict_next_step_metrics(prompt_seq, prompt_ctx, target_token)
         
-        save_log("\nDone.")
-    else:
-        save_log("No valid test data found.")
+        # Task 2
+        gen_len = len(gt_future)
+        pred_k = eval_k.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
+        pred_a = eval_a.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
+        
+        # ===============================================
+        # 追加: 滞在指標の計算
+        # ===============================================
+        # GT系列全体における滞在を評価対象とするか、生成部分のみとするか？
+        # 一般的に長期生成テストなら「生成部分(gt_future)」と比較します。
+        
+        stay_metrics_k = calc_stay_metrics_pair(gt_future, pred_k, NODE_DISTANCES)
+        stay_metrics_a = calc_stay_metrics_pair(gt_future, pred_a, NODE_DISTANCES)
+
+        # 1つのサンプルに複数の滞在が含まれる可能性があるため、リスト構造で保持するか、
+        # ここで「平均」を取ってDataFrameに入れるかですが、詳細分析のため
+        # フラットなリスト（stay_metrics_list）を別途作るのがおすすめです。
+
+        # ここではDataFrame用のmetrics_listに、サンプルごとの平均値として埋め込みます
+        # (詳細な分布を見たい場合は別途 stay_results を保存してください)
+        
+        def summarize_stay(metrics_list):
+            if not metrics_list: return None, None, None
+            
+            # 検出できたものだけを対象に距離平均などを計算
+            detected = [m for m in metrics_list if m['detected']]
+            if not detected: return 0.0, None, None # 検出率0
+            
+            det_rate = len(detected) / len(metrics_list)
+            mean_len_diff = np.mean([m['len_diff'] for m in detected])
+            mean_loc_dist = np.mean([m['loc_dist'] for m in detected])
+            return det_rate, mean_len_diff, mean_loc_dist
+
+        k_rate, k_ldiff, k_loc = summarize_stay(stay_metrics_k)
+        a_rate, a_ldiff, a_loc = summarize_stay(stay_metrics_a)
+
+        metrics_list.append({
+            'id': idx, 'len': gen_len,
+            'k_acc': 1 if acc_k else 0, 'k_prob': like_k,
+            'a_acc': 1 if acc_a else 0, 'a_prob': like_a,
+            'k_ed': calc_levenshtein(gt_future, pred_k),
+            'a_ed': calc_levenshtein(gt_future, pred_a),
+            'k_ged': calc_levenshtein(gt_future, pred_k, geo=True),
+            'a_ged': calc_levenshtein(gt_future, pred_a, geo=True),
+            'k_dtw': calc_dtw(gt_future, pred_k),
+            'a_dtw': calc_dtw(gt_future, pred_a),
+            'k_gdtw': calc_dtw(gt_future, pred_k, geo=True),
+            'a_gdtw': calc_dtw(gt_future, pred_a, geo=True),
+            'prompt': prompt_seq, 'gt': gt_future, 'pred_k': pred_k, 'pred_a': pred_a,
+            'k_stay_rate': k_rate if k_rate is not None else np.nan, # 滞在検出率
+            'k_stay_len_diff': k_ldiff if k_ldiff is not None else np.nan, # 長さ誤差(Pred-GT)
+            'k_stay_dist': k_loc if k_loc is not None else np.nan, # 場所誤差(Hop)
+            
+            'a_stay_rate': a_rate if a_rate is not None else np.nan,
+            'a_stay_len_diff': a_ldiff if a_ldiff is not None else np.nan,
+            'a_stay_dist': a_loc if a_loc is not None else np.nan,
+            
+            'prompt': prompt_seq, 'gt': gt_future, 'pred_k': pred_k, 'pred_a': pred_a
+        })
+
+    # Save Metrics
+    df = pd.DataFrame(metrics_list)
+    csv_path = os.path.join(CONFIG["output_dir"], "metrics.csv")
+    df.to_csv(csv_path, index=False)
+    
+    # =====================================================
+    # 4. Result Summarization
+    # =====================================================
+    def print_metrics(label, d):
+        print(f"\n>>> {label} (N={len(d)})")
+        if len(d) == 0:
+            print("  No samples found.")
+            return
+        print(f"  [Next Token] Acc:     Koopman={d['k_acc'].mean():.4f} | Ablation={d['a_acc'].mean():.4f}")
+        print(f"  [Next Token] Prob:    Koopman={d['k_prob'].mean():.4f} | Ablation={d['a_prob'].mean():.4f}")
+        
+        k_ed = (d['k_ed'] / d['len']).mean()
+        a_ed = (d['a_ed'] / d['len']).mean()
+        k_ged = (d['k_ged'] / d['len']).mean()
+        a_ged = (d['a_ged'] / d['len']).mean()
+        k_dtw = (d['k_dtw'] / d['len']).mean()
+        a_dtw = (d['a_dtw'] / d['len']).mean()
+        k_gdtw = (d['k_gdtw'] / d['len']).mean()
+        a_gdtw = (d['a_gdtw'] / d['len']).mean()
+
+        print(f"  [Gen] ED (norm):      Koopman={k_ed:.4f} | Ablation={a_ed:.4f}")
+        print(f"  [Gen] Geo-ED (norm):  Koopman={k_ged:.4f} | Ablation={a_ged:.4f}")
+        print(f"  [Gen] DTW (norm):     Koopman={k_dtw:.4f} | Ablation={a_dtw:.4f}")
+        print(f"  [Gen] Geo-DTW (norm): Koopman={k_gdtw:.4f} | Ablation={a_gdtw:.4f}")
+
+        # ★ 追加: 滞在指標の表示 (NaNを除去して平均)
+        print("  [Stay Metrics] (Detected Stays Only)")
+        print(f"    Detection Rate:     Koopman={d['k_stay_rate'].mean():.4f} | Ablation={d['a_stay_rate'].mean():.4f}")
+        print(f"    Length Diff (avg):  Koopman={d['k_stay_len_diff'].mean():.4f} | Ablation={d['a_stay_len_diff'].mean():.4f}")
+        print(f"    Loc Dist (hops):    Koopman={d['k_stay_dist'].mean():.4f}     | Ablation={d['a_stay_dist'].mean():.4f}")
+
+    df_short = df[df['len'] <= 9]
+    df_long  = df[df['len'] > 9]
+
+    print("\n" + "="*50)
+    print("Evaluation Summary")
+    print("="*50)
+    print_metrics("Overall", df)
+    print_metrics("Short Term (<= 9 steps)", df_short)
+    print_metrics("Long Term (> 9 steps)", df_long)
+    print("-" * 50)
+    
+    # =====================================================
+    # 5. Plotting
+    # =====================================================
+    plot_pdf_path = os.path.join(CONFIG["output_dir"], "trajectories_sample.pdf")
+    max_plot = CONFIG["plot_max_samples"]
+    print(f"\nGenerating PDF plots for first {max_plot} samples...")
+    
+    with PdfPages(plot_pdf_path) as pdf:
+        rows, cols = 5, 4
+        per_page = rows * cols
+        df_plot = df.head(max_plot)
+        num_plots = len(df_plot)
+        num_pages = (num_plots + per_page - 1) // per_page
+        
+        for p in range(num_pages):
+            fig, axes = plt.subplots(rows, cols, figsize=(20, 24))
+            axes = axes.flatten()
+            start_i = p * per_page
+            for i in range(per_page):
+                curr_i = start_i + i
+                ax = axes[i]
+                if curr_i < num_plots:
+                    row = df_plot.iloc[curr_i]
+                    full_gt = row['prompt'] + row['gt']
+                    full_k = row['prompt'] + row['pred_k']
+                    full_a = row['prompt'] + row['pred_a']
+                    ax.plot(full_gt, 'k-', alpha=0.3, label='GT', linewidth=2)
+                    start_x = len(row['prompt'])
+                    end_x = start_x + len(row['pred_k'])
+
+                    ax.plot(range(start_x, end_x), row['pred_k'], 'r.-', label='Koopman', alpha=0.8)
+                    ax.plot(range(start_x, end_x), row['pred_a'], 'b.--', label='Ablation', alpha=0.6)
+
+                    ax.axvline(x=len(row['prompt'])-0.5, color='gray', linestyle=':')
+                    ax.set_title(f"ID:{row['id']}\nAcc:{row['k_acc']}/{row['a_acc']} GeoDTW:{row['k_gdtw']:.2f}", fontsize=8)
+                    ax.set_yticks(range(0, 38, 2))
+                    ax.grid(True, alpha=0.3)
+                    if i == 0: ax.legend(fontsize=6)
+                else:
+                    ax.axis('off')
+            plt.tight_layout()
+            pdf.savefig(fig)
+            plt.close()
+            
+    print(f"Completed. Saved to {CONFIG['output_dir']}")
+
+if __name__ == "__main__":
+    main()

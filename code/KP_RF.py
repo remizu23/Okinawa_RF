@@ -251,224 +251,74 @@ class KoopmanRoutesFormer(nn.Module):
         holidays,      # [Batch, Seq]
         time_zones,    # [Batch, Seq]
         events,        # [Batch, Seq]
-        time_tensor=None, # kept for compatibility, unused
+        time_tensor=None, 
         return_debug=False
     ):
         """
-        tokens: [Batch, Seq]
-        stay_counts: [Batch, Seq]
-        agent_ids: [Batch]  (各系列に1つのID)
+        Modified forward:
+        Structure: Inputs -> Transformer -> z_t -> [Dynamics: Az + Bu] -> z_{t+1} -> Logits
         """
         batch_size, seq_len = tokens.size()
         device = tokens.device
 
-        # リスト等が来たらTensor化
-        # if not isinstance(plaza_base_ids, torch.Tensor):
-        #     plaza_base_ids = torch.tensor(plaza_base_ids, device=device).long()
-        # else:
-        #     plaza_base_ids = plaza_base_ids.to(device).long()
-
-        # # --- 1. 広場のアクティブ判定 (厳密版) ---
-        # if time_tensor is not None:
-        #     # ★★★ 修正: 単純な2025年判定ではなく、期間重複判定を使う ★★★
-        #     # time_tensor: [Batch] -> is_plaza_active: [Batch, 1, 1] (bool)
-        #     is_plaza_active_bool = self.check_plaza_active(time_tensor, seq_len)
-        # else:
-        #     # 時刻がない場合は、デフォルトでFalse（あるいは推論時はTrueにしたい場合は引数制御）
-        #     # ここでは安全側に倒してFalse、もしくは「2025」とみなすならTrue
-        #     is_plaza_active_bool = torch.zeros(batch_size, 1, 1, dtype=torch.bool, device=device)
-
-        # --- 1. 各埋め込みの取得 ---
+        # --- 1. 各埋め込みの取得 (u_t の作成) ---
         token_vec = self.token_embedding(tokens)        # [B, T, token_dim]
         stay_vec = self.stay_embedding(stay_counts)     # [B, T, stay_dim]
         
-        # AgentIDは系列全体で共通なので拡張する
+        # AgentIDは系列全体で共通なので拡張
         agent_vec = self.agent_embedding(agent_ids)     # [B, agent_dim]
         agent_vec = agent_vec.unsqueeze(1).expand(-1, seq_len, -1) # [B, T, agent_dim]
 
-        # New Contexts
+        # Contexts
         holiday_vec = self.holiday_embedding(holidays)     # [B, T, holiday_dim]
         timezone_vec = self.time_zone_embedding(time_zones) # [B, T, timezone_dim]
         event_vec = self.event_embedding(events)           # [B, T, event_dim]
 
-        # # ★0120追加：広場埋め込み（複数対応）concat
-        # # token ID から base node ID への変換 (MoveもStayも同じ場所なら同じIDに)
-        # # 例: base_N=19の場合, ID 2(Move) -> 2, ID 21(Stay) -> 2
-        # pad_id = self.token_embedding.padding_idx
-        # tokens_long = tokens.long()
-        # curr_is_node = (tokens_long < pad_id)
-        
-        # curr_base = torch.zeros_like(tokens_long)
-        # curr_base[curr_is_node] = tokens_long[curr_is_node] % self.base_N
-
-        # # B. 場所の判定: 「今いる場所」が「広場リストのどれか」に含まれるか？
-        # # isin を使って一括判定
-        # is_at_target_loc = torch.isin(curr_base, plaza_base_ids) & curr_is_node
-        # is_at_target_loc = is_at_target_loc.unsqueeze(-1) # [B, T, 1]
-        
-        # # C. 最終的な広場フラグ: (場所にいる) AND (時間がアクティブ)
-        # # is_plaza_active_bool は [B, 1, 1] なので T方向に放送される
-        # plaza_status = is_at_target_loc & is_plaza_active_bool 
-
-        # plaza_vec = self.plaza_embedding(plaza_status.long().squeeze(-1)) # [B, T, dim]
-
-        # ★★★ 結合 (u_t に plaza_vec を追加) ★★★
+        # ★結合 (u_t): 現在時刻の入力全セット
         u_all = torch.cat([
             token_vec, stay_vec, agent_vec, 
             holiday_vec, timezone_vec, event_vec
         ], dim=-1)        
 
-        ### 年埋め込み(不使用) ###
-        # if time_tensor is not None:
-        #     years = time_tensor // 100000000
-        #     # 2024->0, 2025->1 のようにID化してEmbedding
-        #     year_ids = (years == 2025).long().unsqueeze(1).expand(-1, seq_len)
-        #     year_vec = self.year_embedding(year_ids)
-        # else:
-        #     # なければゼロ埋めなど
-        #     year_vec = torch.zeros(batch_size, seq_len, 4).to(tokens.device)
-        # # ★u_all に year_vec も結合
-        # u_all = torch.cat([token_vec, stay_vec, agent_vec, year_vec], dim=-1)
-
-        # Koopman用の入力 u_curr (最後の時刻を除く)
-        u_curr = u_all[:, :-1, :]
-
         # --- 2. Transformerへの入力 ---
-        x = self.input_proj(u_all) # 次元圧縮 [B, T, d_model]
+        # u_all を射影して Transformer に通す
+        x = self.input_proj(u_all) # [B, T, d_model]
         x = self.pos_encoder(x)
         
-        # マスク作成 (変更なし)
+        # マスク作成
         causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
         pad_mask = (tokens == self.token_embedding.padding_idx).to(x.device)
-        # --- 3. 状態推定 (h_t) ---
+        
+        # --- 3. 状態推定 (h_t -> z_t) ---
         h = self.transformer_block(
             src=x, 
             mask=causal_mask, 
             src_key_padding_mask=pad_mask
         )
-        
-        # --- 4. 潜在変数 (z_t) ---
-        z_hat = self.to_z(h)
-        z_curr = z_hat[:, :-1, :]
+        z_hat = self.to_z(h) # [B, T, z_dim] これは「現在の状態 z_t」
 
-        # --- 5. Koopman Dynamics ---
-        # z_{t+1} = A * z_t + B * u_t (u_t は結合ベクトル)
+        # --- 4. Koopman Dynamics (z_t -> z_{t+1}) ---
+        # ★ここが変更点: 系列全体に対して一括でダイナミクスを適用
+        # z_{t+1} = A * z_t + B * u_t
+        # output shape: [B, T, z_dim]
+        # ※この z_pred_next の t番目の要素は、時刻 t+1 の状態を予測したもの
         z_pred_next = (
-            torch.einsum("ij,btj->bti", self.A, z_curr) + 
-            torch.einsum("ij,btj->bti", self.B, u_curr)
+            torch.einsum("ij,btj->bti", self.A, z_hat) + 
+            torch.einsum("ij,btj->bti", self.B, u_all)
         )
 
-        # --- Base logits ---
-        logits = self.to_logits(z_hat)
+        # --- 5. Logitsの計算 ---
+        # ★変更: Transformerの生出力(z_hat)ではなく、
+        # ダイナミクスで予測した次ステップの状態(z_pred_next)から次ノードを予測する
+        logits = self.to_logits(z_pred_next) # [B, T, vocab_size]
 
         if return_debug:
-            # dummy debug info
-            debug_info = {
-                "delta_gate": torch.zeros(batch_size, seq_len, 1, device=tokens.device),
-                "delta_bias": torch.zeros_like(logits)
-            }
+            # debug info (必要なら適宜修正)
+            debug_info = {}
             return logits, z_hat, z_pred_next, u_all, debug_info
         else:
             return logits, z_hat, z_pred_next, u_all
 
-        # # --- Add delta-distance-to-plaza bias (optional) ---
-        # base_logits = logits.clone() # バイアス足す前の素の予測値
-        # final_dist_bias = torch.zeros_like(logits) # バイアス値
-        # gate_value = torch.zeros(batch_size, seq_len, 1, device=tokens.device) # ゲート値
-
-        # if getattr(self, "dist_mat_base", None) is not None:
-        #     # tokens: [B,T]
-        #     pad_id = self.token_embedding.padding_idx
-        #     tokens_long = tokens.long()
-
-        #     # Identify valid node tokens (move or stay) at current timestep
-        #     curr_is_node = (tokens_long < pad_id)
-        #     curr_base = torch.zeros_like(tokens_long)
-        #     curr_base[curr_is_node] = tokens_long[curr_is_node] % self.base_N
-
-        #     # 1. 現在地から「各広場」までの距離 [B, T, NumPlazas]
-        #     # dist_mat_base: [N, N] -> [B, T, N] から必要な列を抜くイメージ
-        #     # index_select 等を使うか、単純にスライス
-        #     d_curr_all = self.dist_mat_base[curr_base][:, :, plaza_base_ids] # [B, T, NumPlazas]
-            
-        #     # 最も近い広場までの距離を採用
-        #     d_curr, _ = torch.min(d_curr_all, dim=-1) # [B, T]
-
-        #     # 2. 次の候補地から「各広場」までの距離 [V, NumPlazas]
-        #     d_next_vocab_all = self.dist_mat_base[self.candidate_base_id][:, plaza_base_ids]
-            
-        #     # 最も近い広場までの距離
-        #     d_next_vocab, _ = torch.min(d_next_vocab_all, dim=-1) # [V]
-
-        #     # Delta distance: d(next) - d(curr)
-        #     delta = d_next_vocab.view(1, 1, -1) - d_curr.unsqueeze(-1)  # [B, T, V]
-
-        #     # Bin index: 0=toward(<0), 1=same(=0), 2=away(>0)
-        #     bin_idx = torch.full_like(delta, 1, dtype=torch.long)
-        #     bin_idx = torch.where(delta < 0, torch.zeros_like(bin_idx), bin_idx)
-        #     bin_idx = torch.where(delta > 0, torch.full_like(bin_idx, 2), bin_idx)
-        #     # bin_idx shape: [B, T, V]
-
-        #     # ★★★ 修正: 重みの選択も厳密判定に基づく ★★★
-        #     w_inactive = self.delta_bin_weight[0][bin_idx] 
-        #     w_active   = self.delta_bin_weight[1][bin_idx]         
-
-        #     # 3. データの年に応じてどちらを使うか選択
-        #     # years: [B] -> [B, 1, 1]
-        #     years = time_tensor // 100000000
-        #     is_2025 = (years == 2025).view(batch_size, 1, 1)
-            
-        #     # is_plaza_active_bool: [B, 1, 1] -> 放送して切り替え
-        #     w = torch.where(is_plaza_active_bool, w_active, w_inactive)
-
-        #     # Context gate g_t [B, T, 1]
-        #     g = torch.sigmoid(self.delta_gate(z_hat))
-
-        #     # マスク処理
-        #     time_mask = curr_is_node & (tokens_long != pad_id)
-        #     g = g * time_mask.unsqueeze(-1).float()
-
-        #     # ★計算した値を保存
-        #     gate_value = g
-
-        #     if self.delta_bias_move_only:
-        #         cand_mask = self.candidate_is_move.float().view(1, 1, -1)
-        #     else:
-        #         cand_mask = (torch.arange(logits.size(-1), device=logits.device) < pad_id).float().view(1, 1, -1)
-
-        #     # 最終的なバイアス項
-        #     dist_bias = g * w * cand_mask
-
-        #     # ★保存
-        #     final_dist_bias = dist_bias
-
-            # 2025年（広場あり）の時だけバイアスを有効にする（不使用：バイアスの程度を比べるため．）
-            # if time_tensor is not None:
-            #     years = time_tensor // 100000000
-            #     # 2025年なら 1.0, それ以外なら 0.0
-            #     # viewで形状を [Batch, 1, 1] にして放送(broadcast)できるようにする
-            #     is_plaza_active = (years == 2025).float().view(batch_size, 1, 1)
-                
-            #     # 0.0 を掛ければバイアスは消滅する
-            #     dist_bias = dist_bias * is_plaza_active
-
-            # =================================================================
-            # ★★★ 追加: 広場近傍 2-hop 限定マスク (Proximity Mask) ★★★
-            # =================================================================
-            # d_curr: [Batch, Seq] (現在地から最も近い広場への距離)
-            # 現在地が広場から 2-hop 以内なら 1.0, それ以外なら 0.0
-            
-            # INFLUENCE_RADIUS = 2  # 2-hop以内
-            
-            # # d_curr <= 2 の箇所だけ True
-            # proximity_mask = (d_curr <= INFLUENCE_RADIUS).float().unsqueeze(-1) # [B, T, 1]
-            
-            # # バイアスにマスクを掛ける (範囲外ならバイアスは0になる)
-            # dist_bias = dist_bias * proximity_mask
-            # # =================================================================
-
-            # logits = logits + dist_bias
-            
     def set_plaza_dist(self, full_dist_mat: torch.Tensor, plaza_id: int):
         """
         分析・シナリオ用に、特定のノード(plaza_id)を広場とした場合の距離行列をセットする。
