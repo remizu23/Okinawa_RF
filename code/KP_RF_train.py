@@ -36,9 +36,14 @@ wandb.config = type("C", (), {
     "agent_emb_dim": 16,
     "stay_emb_dim": 16,
     "max_stay_count": 500, # 必要に応じて調整
+
+    # ★New Context Dimensions
+    "holiday_emb_dim": 4,
+    "time_zone_emb_dim": 4,
+    "event_emb_dim": 4,
     
     # ★★★ Ablation Study用設定 ★★★
-    "use_koopman_loss": True,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
+    "use_koopman_loss": False,  # True: 提案手法(Koopmanあり), False: 比較手法(なし) ←ここを切り替えて2回実験！
     "koopman_alpha": 0.1       # Koopman Lossの重み
 })()
 
@@ -53,7 +58,7 @@ def stamp(name):
     return os.path.join(out_dir, name)
 
 # --- データの準備 ---
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m4.npz') ##インプットを変えたら変える！
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m4_emb.npz') ##インプットを変えたら変える！
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
@@ -120,6 +125,10 @@ network = Network(expanded_adj, expanded_features)
 trip_arr = trip_arrz['route_arr']
 time_arr = trip_arrz['time_arr']
 
+holiday_arr = trip_arrz['holiday_arr']
+timezone_arr = trip_arrz['time_zone_arr']
+event_arr = trip_arrz['event_arr']
+
 # ★ユーザーIDの読み込み (npzに含まれていると仮定)
 if 'agent_ids' in trip_arrz:
     agent_ids_arr = trip_arrz['agent_ids']
@@ -130,23 +139,26 @@ else:
 
 
 
-route = torch.from_numpy(trip_arr)
-time_pt = torch.from_numpy(time_arr)
-agent_pt = torch.from_numpy(agent_ids_arr).long() # ★テンソル化
+# Tensor化
+route_pt = torch.from_numpy(trip_arr).long()
+time_pt = torch.from_numpy(time_arr) # 時刻自体はEmbeddingには使わないがTimeTensorとして一応渡す
+agent_pt = torch.from_numpy(agent_ids_arr).long()
+holiday_pt = torch.from_numpy(holiday_arr).long()
+timezone_pt = torch.from_numpy(timezone_arr).long()
+event_pt = torch.from_numpy(event_arr).long()
+
 vocab_size = network.N + 4
 
 # データセット定義
 class MyDataset(torch.utils.data.Dataset):
-    def __init__(self, data1, data2, data3):
-        self.data1 = data1
-        self.data2 = data2
-        self.data3 = data3
-    def __len__(self):
-        return len(self.data1)
+    def __init__(self, r, t, a, h, tz, e):
+        self.r = r; self.t = t; self.a = a
+        self.h = h; self.tz = tz; self.e = e
+    def __len__(self): return len(self.r)
     def __getitem__(self, idx):
-        return self.data1[idx], self.data2[idx], self.data3[idx]
+        return self.r[idx], self.t[idx], self.a[idx], self.h[idx], self.tz[idx], self.e[idx]
 
-dataset = MyDataset(route, time_pt, agent_pt)
+dataset = MyDataset(route_pt, time_pt, agent_pt, holiday_pt, timezone_pt, event_pt)
 
 # データ分割 (8:2)
 num_samples = len(dataset)
@@ -156,48 +168,48 @@ train_data, val_data = random_split(dataset, [train_size, val_size])
 
 # パディング関数の定義
 def collate_fn_pad(batch):
-    # batchは (route, time, agent) のタプルのリスト
-    routes_raw, times, agents = zip(*batch)
+    # Unpack 6 items
+    routes, times, agents, holidays, timezones, events = zip(*batch)
 
-    # 1. まず各データの「本当の長さ（38以外の部分）」を特定して切り出す
-    trimmed_routes = []
-    for r in routes_raw:
-        # r が Tensor か numpy かで分岐
-        if isinstance(r, torch.Tensor):
-            r_np = r.cpu().numpy()
-        else:
-            r_np = np.array(r)
-            
-        # 38 (パディング) が最初に現れる位置を探す
-        # もし38がなければそのまま、あればそこまでで切る
+    # 1. Trim padding based on route (assuming 38 is padding)
+    trimmed_data = []
+    for i in range(len(routes)):
+        r_np = routes[i].cpu().numpy()
         pad_indices = np.where(r_np == 38)[0]
-        if len(pad_indices) > 0:
-            real_len = pad_indices[0]
-            # ただし、長さ0になってしまうと困るので最低1は残すなどのケアが必要かも
-            # ここではシンプルにスライス
-            trimmed_r = r_np[:real_len]
-        else:
-            trimmed_r = r_np # パディングなし（フル）
-
-        # Tensorにしてリストに追加
-        trimmed_routes.append(torch.tensor(trimmed_r, dtype=torch.long))
-
-    # 2. このバッチ内での最大長を取得
-    lengths = [len(r) for r in trimmed_routes]
+        real_len = pad_indices[0] if len(pad_indices) > 0 else len(r_np)
+        
+        # Trim all sequence tensors
+        trimmed_data.append({
+            'r': routes[i][:real_len],
+            'h': holidays[i][:real_len],
+            'tz': timezones[i][:real_len],
+            'e': events[i][:real_len]
+        })
+    
+    lengths = [len(x['r']) for x in trimmed_data]
     max_len = max(lengths) if lengths else 0
 
-    # 3. 最大長に合わせてパディングし直す
-    padded_routes = torch.zeros(len(trimmed_routes), max_len, dtype=torch.long) + 38 
-    
-    for i, r in enumerate(trimmed_routes):
-        end = len(r)
-        padded_routes[i, :end] = r
-            
-    # Time, Agentはそのまま
-    times = torch.tensor(times)
-    agents = torch.tensor(agents)
-    
-    return padded_routes, times, agents
+    # 2. Re-pad
+    padded_routes = torch.full((len(batch), max_len), 38, dtype=torch.long)
+    padded_holidays = torch.zeros((len(batch), max_len), dtype=torch.long)
+    padded_timezones = torch.zeros((len(batch), max_len), dtype=torch.long)
+    padded_events = torch.zeros((len(batch), max_len), dtype=torch.long)
+
+    for i, item in enumerate(trimmed_data):
+        L = len(item['r'])
+        padded_routes[i, :L] = item['r']
+        padded_holidays[i, :L] = item['h']
+        padded_timezones[i, :L] = item['tz']
+        padded_events[i, :L] = item['e']
+
+    return (
+        padded_routes, 
+        torch.tensor(times), 
+        torch.tensor(agents),
+        padded_holidays,
+        padded_timezones,
+        padded_events
+    )
 
 # DataLoaderにセット
 train_loader = DataLoader(
@@ -225,23 +237,28 @@ num_agents = int(agent_pt.max().item()) + 1
 model = KoopmanRoutesFormer(
     vocab_size=vocab_size,
     token_emb_dim=wandb.config.d_ie, 
-    d_model=d_model,                 
+    d_model=wandb.config.d_ie, # using d_ie as d_model based on prev code
     nhead=wandb.config.head_num,     
     num_layers=wandb.config.B_de,
     d_ff=wandb.config.d_ff,
     z_dim=wandb.config.z_dim,
     pad_token_id=network.N,
-    # --- Δ距離(広場)バイアス用 ---
     dist_mat_base=dist_mat_base,
     base_N=base_N,
     delta_bias_move_only=True,
     dist_is_directed=dist_is_directed,
-    # ★追加引数
+    
     num_agents=num_agents,
     agent_emb_dim=wandb.config.agent_emb_dim,
     max_stay_count=wandb.config.max_stay_count,
-    stay_emb_dim=wandb.config.stay_emb_dim
+    stay_emb_dim=wandb.config.stay_emb_dim,
+    
+    # ★Pass new dimensions
+    holiday_emb_dim=wandb.config.holiday_emb_dim,
+    time_zone_emb_dim=wandb.config.time_zone_emb_dim,
+    event_emb_dim=wandb.config.event_emb_dim
 )
+
 model = model.to(device)
 
 # # 滞在トークン・移動トークンの初期埋め込みを似せる
@@ -313,41 +330,57 @@ for epoch in range(wandb.config.epochs):
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]", leave=False)
     
     for batch in pbar:
-        route_batch, time_batch, agent_batch = batch 
-        route_batch = route_batch.to(device)
-        agent_batch = agent_batch.to(device)
-        time_batch = time_batch.to(device)
-        
+        r_b, t_b, a_b, h_b, tz_b, e_b = batch
+        r_b, a_b, h_b, tz_b, e_b = r_b.to(device), a_b.to(device), h_b.to(device), tz_b.to(device), e_b.to(device)        
         tokenizer = Tokenization(network)
-        input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
-        target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
-        
+        input_tokens = tokenizer.tokenization(r_b, mode="simple").long().to(device)
+        target_tokens = tokenizer.tokenization(r_b, mode="next").long().to(device)
         stay_counts = tokenizer.calculate_stay_counts(input_tokens)
+
+        # Context arrays need to be shifted/aligned like tokens
+        # tokenization adds <b> at start, so pad contexts at start
+        # Use simple '0' padding for <b> position
         
-        # === ★デバッグ用コード追加開始 ===
-        # モデルが許容する最大値
-        max_vocab = model.token_embedding.num_embeddings
-        max_stay = model.stay_embedding.num_embeddings
-        max_agent = model.agent_embedding.num_embeddings
-
-        # 入力データの最大値
-        curr_token_max = input_tokens.max().item()
-        curr_stay_max = stay_counts.max().item()
-        curr_agent_max = agent_batch.max().item()
-
-        # チェック
-        if curr_token_max >= max_vocab:
-            print(f"【エラー原因】トークンID超過: 入力{curr_token_max} >= 許容{max_vocab}")
-        if curr_stay_max >= max_stay:
-            print(f"【エラー原因】滞在カウント超過: 入力{curr_stay_max} >= 許容{max_stay}")
-        if curr_agent_max >= max_agent:
-            print(f"【エラー原因】Agent ID超過: 入力{curr_agent_max} >= 許容{max_agent}")
-        # === ★デバッグ用コード追加終了 ===
-
-        # ★修正: 4つの戻り値を受け取る (u_allが必要)
-        logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch, time_tensor=time_batch)        
+        # input_tokens は [B, T] の形状 (先頭に<b>が入っている)
+        B_size, T = input_tokens.shape   # T がモデルが期待する Seq 長(=19など)
         
-        # 1. CE Loss (全員共通)
+        # ★★★ 修正: ユーザー提案の align_ctx 関数を採用 ★★★
+        # 先頭(index 0)は <b> に対応するため 0 (Padding/Default) にし、
+        # index 1 以降にコンテキストデータを配置する。
+        # これにより、トークン列とコンテキスト列の「時刻」が正しく同期します。
+        
+        def align_ctx(ctx, target_len):
+            # ctx: [B, L]
+            ctx = ctx.to(device)
+            # 全体を0で初期化 (padding_idx=0 前提)
+            out = torch.zeros((B_size, target_len), dtype=torch.long, device=device)
+            
+            # コピーする長さ (ターゲット長-1 か、元の長さ の小さい方)
+            # target_len - 1 なのは、先頭1つを空けるため
+            copy_len = min(ctx.shape[1], target_len - 1)
+            
+            if copy_len > 0:
+                # outの index 1 から埋める
+                out[:, 1 : 1 + copy_len] = ctx[:, :copy_len]
+                
+            return out
+
+        h_in  = align_ctx(h_b,  T)
+        tz_in = align_ctx(tz_b, T)
+        e_in  = align_ctx(e_b,  T)
+
+        # Forward
+        logits, z_hat, z_pred_next, u_all = model(
+            tokens=input_tokens, 
+            stay_counts=stay_counts, 
+            agent_ids=a_b, 
+            holidays=h_in,
+            time_zones=tz_in,
+            events=e_in,
+            time_tensor=None # Unused
+        )
+
+        # 1. CE Loss (共通)
         loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
         
         # 初期化
@@ -474,17 +507,37 @@ for epoch in range(wandb.config.epochs):
     }    
 
     with torch.no_grad():
-        for route_batch, time_batch, agent_batch in val_loader:
-            route_batch = route_batch.to(device)
-            agent_batch = agent_batch.to(device)
-            time_batch = time_batch.to(device)
-            
+        for r_b, t_b, a_b, h_b, tz_b, e_b in val_loader:
+            r_b, a_b, h_b, tz_b, e_b = r_b.to(device), a_b.to(device), h_b.to(device), tz_b.to(device), e_b.to(device)
+
             tokenizer = Tokenization(network)
-            input_tokens = tokenizer.tokenization(route_batch, mode="simple").long().to(device)
-            target_tokens = tokenizer.tokenization(route_batch, mode="next").long().to(device)
+            input_tokens = tokenizer.tokenization(r_b, mode="simple").long().to(device)
+            target_tokens = tokenizer.tokenization(r_b, mode="next").long().to(device)
             stay_counts = tokenizer.calculate_stay_counts(input_tokens)
 
-            logits, z_hat, z_pred_next, u_all = model(input_tokens, stay_counts, agent_batch, time_tensor=time_batch)
+            # input_tokens は [B, T] の形状 (先頭に<b>が入っている)
+            B_size, T = input_tokens.shape   # T がモデルが期待する Seq 長(=19など)
+            def align_ctx(ctx, target_len):
+                    # ctx: [B, L]
+                    # deviceは外部スコープのものを使用
+                    out = torch.zeros((B_size, target_len), dtype=torch.long, device=device)
+                    copy_len = min(ctx.shape[1], target_len - 1)
+                    if copy_len > 0:
+                        out[:, 1 : 1 + copy_len] = ctx[:, :copy_len]
+                    return out
+            h_in  = align_ctx(h_b,  T)
+            tz_in = align_ctx(tz_b, T)
+            e_in  = align_ctx(e_b,  T)
+
+            logits, z_hat, z_pred_next, u_all = model(
+                tokens=input_tokens, 
+                stay_counts=stay_counts, 
+                agent_ids=a_b, 
+                holidays=h_in,
+                time_zones=tz_in,
+                events=e_in,
+                time_tensor=None # Unused
+            )
 
             loss_ce = ce_loss_fn(logits.view(-1, vocab_size), target_tokens.view(-1))
             loss_total = loss_ce 
