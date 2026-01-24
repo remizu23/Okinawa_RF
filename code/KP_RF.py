@@ -3,13 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-# 既存の便利クラスはそのまま利用
 class EmbeddingWithFeatures(nn.Module):
     def __init__(self, vocab_size, token_dim, feature_dim=None, feature_emb_dim=None, dropout=0.1):
         super(EmbeddingWithFeatures, self).__init__()
-        self.token_embedding = nn.Embedding(vocab_size, token_dim, padding_idx=38) # padding_idx指定推奨
-        
-        # 特徴量を埋め込み次元に変換する層
+        self.token_embedding = nn.Embedding(vocab_size, token_dim, padding_idx=38)
         if feature_dim and feature_emb_dim:
             self.feature_projection = nn.Linear(feature_dim, feature_emb_dim)
             self.use_features = True
@@ -22,11 +19,9 @@ class EmbeddingWithFeatures(nn.Module):
     def forward(self, tokens, features=None):
         tokens = tokens.to(self.device)
         token_emb = self.token_embedding(tokens)
-        
         if self.use_features and features is not None:
             features = features.to(self.device)
             feature_emb = self.feature_projection(features)
-            # トークン埋め込みと特徴量埋め込みを結合
             emb = torch.cat((token_emb, feature_emb), dim=-1)
         else:
             emb = token_emb
@@ -44,12 +39,8 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x: [Batch, Seq, Dim] -> pe: [Seq, 1, Dim] -> transpose to add
         x = x + self.pe[:x.size(1), :].transpose(0, 1)
         return self.dropout(x)
-
-
-#0105ノード埋め込み変更版
 
 class KoopmanRoutesFormer(nn.Module):
     def __init__(
@@ -62,59 +53,34 @@ class KoopmanRoutesFormer(nn.Module):
         d_ff, 
         z_dim,            
         pad_token_id=38,
-        # --- Delta-distance (to plaza) bias ---
-        # dist_mat_base: [base_N, base_N] shortest-path distance matrix on the *base* graph (0..base_N-1).
-        # If provided, the model will add an additive bias to logits that depends on the change in
-        # distance-to-plaza between the current token and each candidate next token.
         dist_mat_base: torch.Tensor | None = None,
-        # base_N: number of base nodes (e.g., 19). If None, inferred as pad_token_id//2.
         base_N: int | None = None,
-        # Whether to apply delta-distance bias only to MOVE tokens (0..base_N-1). Recommended: True.
         delta_bias_move_only: bool = True,
-        # Whether to treat the base graph as directed when computing distances (distance matrix must match).
-        # (This flag is informational; computation happens outside this class.)
         dist_is_directed: bool = False,
-        # ★追加引数
-        num_agents=1,        # 全エージェント数 (IDの最大値+1)
-        agent_emb_dim=16,    # エージェントIDの埋め込み次元
-        max_stay_count=500,  # 滞在カウントの最大値
-        stay_emb_dim=16,      # 滞在カウントの埋め込み次元
-
-        # --- ★New Context Embeddings★ ---
+        num_agents=1,        
+        agent_emb_dim=16,    
+        max_stay_count=500,  
+        stay_emb_dim=16,
         holiday_emb_dim=4,
         time_zone_emb_dim=4,
         event_emb_dim=4
     ):
         super().__init__()
         
-        # 1. 埋め込み層の定義
         self.token_embedding = nn.Embedding(vocab_size, token_emb_dim, padding_idx=pad_token_id)
-        
-        # ★追加: ユーザーIDと滞在カウントの埋め込み
         self.agent_embedding = nn.Embedding(num_agents, agent_emb_dim)
-        self.stay_embedding = nn.Embedding(max_stay_count + 1, stay_emb_dim, padding_idx=0) # 0をパディング扱いとする想定
+        self.stay_embedding = nn.Embedding(max_stay_count + 1, stay_emb_dim, padding_idx=0)
 
-        # ★0120追加: 広場フラグ埋め込み (0:広場じゃない, 1:広場である)
-        # self.plaza_embedding = nn.Embedding(2, plaza_emb_dim)
-
-        # 2. New Context Embeddings
-        # 0:False, 1:True
         self.holiday_embedding = nn.Embedding(2, holiday_emb_dim)
-        # 0:Day, 1:Night
         self.time_zone_embedding = nn.Embedding(2, time_zone_emb_dim)
-        # 0:NoEvent, 1:EventActive
         self.event_embedding = nn.Embedding(2, event_emb_dim)
 
-        # Total dimension for concatenation
         total_input_dim = (token_emb_dim + agent_emb_dim + stay_emb_dim + 
                            holiday_emb_dim + time_zone_emb_dim + event_emb_dim)
         
         self.pos_encoder = PositionalEncoding(d_model)
-
-        # ★射影層の入力次元を変更 (total_input_dim -> d_model)
         self.input_proj = nn.Linear(total_input_dim, d_model)
 
-        # 2. Transformer Block (変更なし)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
@@ -123,201 +89,171 @@ class KoopmanRoutesFormer(nn.Module):
         )
         self.transformer_block = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # 3. 射影層 (変更なし)
         self.to_z = nn.Linear(d_model, z_dim)
         self.to_logits = nn.Linear(z_dim, vocab_size) 
 
-        # --- Delta-distance bias components ---
         self.base_N = int(base_N) if base_N is not None else int(pad_token_id) // 2
-        self.delta_bias_move_only = bool(delta_bias_move_only)
-        self.dist_is_directed = bool(dist_is_directed)
+        self.pad_token_id = pad_token_id
+
+        # Koopman Dynamics
+        self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
+        self.B = nn.Parameter(torch.randn(z_dim, total_input_dim) * 0.05) 
+
+        self.count_decoder = nn.Linear(z_dim, 1)
+        self.mode_classifier = nn.Linear(z_dim, 2)
+
 
         if dist_mat_base is not None:
-            # store distance matrix as a buffer (moves with .to(device), not trained)
+            # 距離行列をバッファとして登録
             if not isinstance(dist_mat_base, torch.Tensor):
                 dist_mat_base = torch.tensor(dist_mat_base)
             self.register_buffer("dist_mat_base", dist_mat_base.long())
 
-            # candidate token -> base node id (0..base_N-1). Special tokens map to 0 but will be masked out.
+            # ★ここが重要: candidate_base_id の作成と登録
             candidate_ids = torch.arange(vocab_size, dtype=torch.long)
-            pad_id = pad_token_id
-            is_node_token = candidate_ids < pad_id  # 0..(2*base_N-1)
+            is_node_token = candidate_ids < pad_token_id 
             candidate_base = torch.zeros_like(candidate_ids)
+            # base_N で割った余りがベースノードID (例: 0->0, 19->0)
             candidate_base[is_node_token] = candidate_ids[is_node_token] % self.base_N
-            self.register_buffer("candidate_base_id", candidate_base)
+            
+            self.register_buffer("candidate_base_id", candidate_base) # <--- これが必要です！
 
-            # candidate token is a MOVE token (0..base_N-1)
-            candidate_is_move = (candidate_ids < self.base_N)
-            self.register_buffer("candidate_is_move", candidate_is_move)
-
-            # Gate g_t (context-dependent strength of plaza attraction), scalar per time step
+            # (以下略)
             self.delta_gate = nn.Linear(z_dim, 1)
-
-            # 3 bins: toward (<0), same (=0), away (>0)
-            # ★修正: 重みを [2, 3] に変更
-            # 0行目: 2024年用 (Toward, Same, Away)
-            # 1行目: 2025年用 (Toward, Same, Away)
             self.delta_bin_weight = nn.Parameter(torch.zeros(2, 3))
 
         else:
-            # Disable delta bias if no distance matrix is given
             self.dist_mat_base = None
-            self.candidate_base_id = None
-            self.candidate_is_move = None
+            self.candidate_base_id = None # <--- ない場合はNoneを入れる
             self.delta_gate = None
             self.delta_bin_weight = None
-        
-        # 4. Koopman Dynamics
-        # ★B行列の入力次元を「合計次元」に変更 (u_t は結合ベクトルになるため)
-        self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
-        self.B = nn.Parameter(torch.randn(z_dim, total_input_dim) * 0.05) 
-
-        # 5. zからの滞在カウント復元強制
-        self.count_decoder = nn.Linear(z_dim, 1)
-
-        # 6. zからの移動/滞在
-        self.mode_classifier = nn.Linear(z_dim, 2) # [Stay, Move]の2値分類
-
-        # ★★★ 広場判定用の定数を登録 (GPU計算用) ★★★
-        # Query Periods: 
-        # 1. 2025-11-22 10:00 ~ 19:00
-        # 2. 2025-11-23 10:00 ~ 17:00
-        # これらを「202511221000」のような整数形式で保持します
-        # self.plaza_periods = [
-        #     (202511221000, 202511221900),
-        #     (202511231000, 202511231700)
-        # ]
-
-# ★★★ ヘルパー関数: 時刻テンソルを「分単位の通算時間」に変換 ★★★
-    def _to_linear_minutes(self, t_tensor):
-        """
-        YYYYMMDDHHMM 形式の整数テンソルを、分単位の連続値に変換する。
-        （月をまたぐ計算は簡易化のため11月固定と仮定しますが、日は考慮します）
-        """
-        # 日、時、分を抽出
-        day = (t_tensor // 10000) % 100
-        hour = (t_tensor // 100) % 100
-        minute = t_tensor % 100
-        
-        # 1日=1440分, 1時間=60分
-        # 基準はとりあえず 0日0時0分 からの経過分とします
-        total_minutes = day * 1440 + hour * 60 + minute
-        return total_minutes
-
-
-    # ★★★ ヘルパー関数: 広場開催中かどうかの厳密判定 ★★★
-    def check_plaza_active(self, start_time_tensor, duration_steps):
-        """
-        start_time_tensor: [Batch]  (各バッチの開始時刻 YYYYMMDDHHMM)
-        duration_steps: int         (系列長 = 経過分数)
-        
-        Returns:
-            is_active: [Batch, 1, 1] (True/False mask, broadcastable)
-        """
-        batch_size = start_time_tensor.size(0)
-        device = start_time_tensor.device
-        
-        # 1. トリップの開始・終了時刻を「通算分」に変換
-        trip_start_mins = self._to_linear_minutes(start_time_tensor) # [Batch]
-        trip_end_mins = trip_start_mins + duration_steps            # [Batch]
-        
-        # 結果を格納するマスク（初期値False）
-        active_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
-        # 2. 定義された各期間との重複チェック
-        for (p_start_int, p_end_int) in self.plaza_periods:
-            # 期間の開始・終了も「通算分」に変換
-            # 定数ですが、broadcastのためにtensor化
-            p_start_mins = self._to_linear_minutes(torch.tensor(p_start_int, device=device))
-            p_end_mins   = self._to_linear_minutes(torch.tensor(p_end_int, device=device))
-            
-            # 重複判定ロジック:
-            # (TripStart < PeriodEnd) AND (TripEnd > PeriodStart)
-            # ※ 「少しでも被ればOK」なので、接するだけ(Start==End)は除外するなら不等号、含めるなら等号付き
-            # ここでは「時間幅を持つ」前提で厳密な不等号を使います
-            is_overlap = (trip_start_mins < p_end_mins) & (trip_end_mins > p_start_mins)
-            
-            # どれか一つの期間にでも被ればOK (OR演算)
-            active_mask = active_mask | is_overlap
-            
-        return active_mask.view(batch_size, 1, 1) # 放送用にreshape
-
 
     def forward(
         self, 
         tokens, 
         stay_counts, 
         agent_ids, 
-        holidays,      # [Batch, Seq]
-        time_zones,    # [Batch, Seq]
-        events,        # [Batch, Seq]
-        time_tensor=None, 
-        return_debug=False
+        holidays,
+        time_zones,
+        events,
+        time_tensor=None
     ):
-        """
-        Modified forward:
-        Structure: Inputs -> Transformer -> z_t -> [Dynamics: Az + Bu] -> z_{t+1} -> Logits
-        """
         batch_size, seq_len = tokens.size()
-        device = tokens.device
 
-        # --- 1. 各埋め込みの取得 (u_t の作成) ---
-        token_vec = self.token_embedding(tokens)        # [B, T, token_dim]
-        stay_vec = self.stay_embedding(stay_counts)     # [B, T, stay_dim]
+        token_vec = self.token_embedding(tokens)
+        stay_vec = self.stay_embedding(stay_counts)
         
-        # AgentIDは系列全体で共通なので拡張
-        agent_vec = self.agent_embedding(agent_ids)     # [B, agent_dim]
-        agent_vec = agent_vec.unsqueeze(1).expand(-1, seq_len, -1) # [B, T, agent_dim]
+        agent_vec = self.agent_embedding(agent_ids)
+        agent_vec = agent_vec.unsqueeze(1).expand(-1, seq_len, -1)
 
-        # Contexts
-        holiday_vec = self.holiday_embedding(holidays)     # [B, T, holiday_dim]
-        timezone_vec = self.time_zone_embedding(time_zones) # [B, T, timezone_dim]
-        event_vec = self.event_embedding(events)           # [B, T, event_dim]
+        holiday_vec = self.holiday_embedding(holidays)
+        timezone_vec = self.time_zone_embedding(time_zones)
+        event_vec = self.event_embedding(events)
 
-        # ★結合 (u_t): 現在時刻の入力全セット
         u_all = torch.cat([
             token_vec, stay_vec, agent_vec, 
             holiday_vec, timezone_vec, event_vec
         ], dim=-1)        
 
-        # --- 2. Transformerへの入力 ---
-        # u_all を射影して Transformer に通す
-        x = self.input_proj(u_all) # [B, T, d_model]
+        x = self.input_proj(u_all)
         x = self.pos_encoder(x)
         
-        # マスク作成
         causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
         pad_mask = (tokens == self.token_embedding.padding_idx).to(x.device)
         
-        # --- 3. 状態推定 (h_t -> z_t) ---
         h = self.transformer_block(
             src=x, 
             mask=causal_mask, 
             src_key_padding_mask=pad_mask
         )
-        z_hat = self.to_z(h) # [B, T, z_dim] これは「現在の状態 z_t」
+        z_hat = self.to_z(h) # [B, T, z_dim]
 
-        # --- 4. Koopman Dynamics (z_t -> z_{t+1}) ---
-        # ★ここが変更点: 系列全体に対して一括でダイナミクスを適用
-        # z_{t+1} = A * z_t + B * u_t
-        # output shape: [B, T, z_dim]
-        # ※この z_pred_next の t番目の要素は、時刻 t+1 の状態を予測したもの
+        # Batch Dynamics
         z_pred_next = (
             torch.einsum("ij,btj->bti", self.A, z_hat) + 
             torch.einsum("ij,btj->bti", self.B, u_all)
         )
 
-        # --- 5. Logitsの計算 ---
-        # ★変更: Transformerの生出力(z_hat)ではなく、
-        # ダイナミクスで予測した次ステップの状態(z_pred_next)から次ノードを予測する
-        logits = self.to_logits(z_pred_next) # [B, T, vocab_size]
+        logits = self.to_logits(z_pred_next) 
 
-        if return_debug:
-            # debug info (必要なら適宜修正)
-            debug_info = {}
-            return logits, z_hat, z_pred_next, u_all, debug_info
-        else:
-            return logits, z_hat, z_pred_next, u_all
+        return logits, z_hat, z_pred_next, u_all
+
+    # =========================================================================
+    # ★ New Methods for Multi-step Rollout
+    # =========================================================================
+    
+    def get_single_step_input(self, token_id, stay_count, agent_id, holiday, timezone, event):
+        """
+        単一ステップ用の入力埋め込み u(t) を作成するヘルパー関数
+        Returns: [Batch, total_input_dim]
+        """
+        # 各IDは [Batch] の1次元テンソルを想定
+        
+        token_vec = self.token_embedding(token_id)      # [B, dim]
+        stay_vec  = self.stay_embedding(stay_count)     # [B, dim]
+        agent_vec = self.agent_embedding(agent_id)      # [B, dim]
+        
+        hol_vec   = self.holiday_embedding(holiday)     # [B, dim]
+        tz_vec    = self.time_zone_embedding(timezone)  # [B, dim]
+        evt_vec   = self.event_embedding(event)         # [B, dim]
+        
+        u_t = torch.cat([
+            token_vec, stay_vec, agent_vec, 
+            hol_vec, tz_vec, evt_vec
+        ], dim=-1)
+        
+        return u_t
+
+    def forward_step(self, z_curr, u_curr):
+        """
+        z(t+1) = A * z(t) + B * u(t)
+        Returns: z_next, logits
+        """
+        # z_curr: [B, z_dim], u_curr: [B, input_dim]
+        # A: [z_dim, z_dim], B: [z_dim, input_dim]
+        
+        term_A = torch.matmul(z_curr, self.A.t()) # [B, z_dim]
+        term_B = torch.matmul(u_curr, self.B.t()) # [B, z_dim]
+        
+        z_next = term_A + term_B
+        logits = self.to_logits(z_next)
+        
+        return z_next, logits
+
+    # KP_RF.py の KoopmanRoutesFormer クラス内に追加/修正
+    def calc_geo_loss(self, logits, targets):
+        """
+        地理的距離損失 (Expected Distance Loss)
+        logits: [Batch, Seq, Vocab]
+        targets: [Batch, Seq]
+        """
+        # 1. 確率分布の計算
+        probs = F.softmax(logits, dim=-1) # [B, T, V]
+        
+        # ★ここが修正点: self.candidate_base_id が存在するかチェック
+        if not hasattr(self, 'candidate_base_id') or self.candidate_base_id is None:
+            return torch.tensor(0.0, device=logits.device)
+
+        # 2. ターゲット(正解)に対応する「ベースノードID」を取得
+        # self.candidate_base_id: TokenID -> BaseNodeID のマッピング
+        target_base_nodes = self.candidate_base_id[targets] # [B, T]
+        
+        # 3. 距離行列の参照
+        # self.dist_mat_base: [BaseN, BaseN]
+        dists_to_nodes = self.dist_mat_base[target_base_nodes] 
+        
+        # 4. 全トークンへの距離に拡張
+        dists_to_tokens = dists_to_nodes[:, :, self.candidate_base_id] # [B, T, V]
+        
+        # 5. 期待距離の計算
+        expected_dist = torch.sum(probs * dists_to_tokens, dim=-1)
+        
+        # 6. マスク処理 (Move/Stayトークンのみ有効)
+        valid_mask = (targets < self.base_N * 2) 
+        
+        loss = (expected_dist * valid_mask.float()).sum() / (valid_mask.sum() + 1e-6)
+        
+        return loss
 
     def set_plaza_dist(self, full_dist_mat: torch.Tensor, plaza_id: int):
         """

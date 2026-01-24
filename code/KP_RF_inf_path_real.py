@@ -37,12 +37,13 @@ CONFIG = {
     "test_npz_path": "/home/mizutani/projects/RF/data/input_real_test_m4_emb.npz",
 
     # モデルパス
-    "model_koopman_path": "/home/mizutani/projects/RF/runs/20260124_195507/model_weights_20260124_195507.pth",
-    "model_ablation_path": "/home/mizutani/projects/RF/runs/20260124_171006/model_weights_20260124_171006.pth",
-    
-    # 出力設定
-    "output_dir": "/home/mizutani/projects/RF/runs/20260124_195507/eval_m5val",
+    "model_koopman_path": "/home/mizutani/projects/RF/runs/20260125_010543/model_weights_20260125_010543.pth",
+    "model_ablation_path": "/home/mizutani/projects/RF/runs/20260124_184039/model_weights_20260124_184039.pth",
+    # 出力設定⭐︎変更忘れない！
+    "output_dir": "/home/mizutani/projects/RF/runs/20260125_010543/eval_m5val_もう一回",
     "plot_max_samples": 1000,
+
+    "val_indices_path": "/home/mizutani/projects/RF/data/common_val_m5.npy",
 
     # Context Logic
     "holidays": [20240928, 20240929, 20251122, 20251123],
@@ -472,17 +473,40 @@ def main():
             agent_ids_full = data['agent_ids']
         else:
             agent_ids_full = np.zeros(len(route_arr_full), dtype=int)
-            
+
+        val_indices_path = CONFIG.get("val_indices_path", None)
+
         # チェックポイントからインデックスを取得
-        print(f"Retrieving validation indices from checkpoint...")
-        checkpoint = torch.load(CONFIG["model_koopman_path"], map_location=device)
-        if "val_indices" not in checkpoint:
-            print("Error: 'val_indices' not found in checkpoint.")
-            return
+        # print(f"Retrieving validation indices from checkpoint...")
+        # checkpoint = torch.load(CONFIG["model_koopman_path"], map_location=device)
+        # if "val_indices" not in checkpoint:
+        #     print("Error: 'val_indices' not found in checkpoint.")
+        #     return
         
-        val_indices = checkpoint["val_indices"]
-        if isinstance(val_indices, torch.Tensor):
-            val_indices = val_indices.cpu().numpy()
+        # val_indices = checkpoint["val_indices"]
+        print(f"Retrieving validation indices from checkpoint...")
+
+        # 1) まず固定ファイルがあればそれを使う
+        if val_indices_path is not None and os.path.exists(val_indices_path):
+            val_indices = np.load(val_indices_path)
+            print(f"Loaded fixed val_indices from: {val_indices_path} (N={len(val_indices)})")
+
+        # 2) なければ Koopman ckpt から取得して保存する
+        else:
+            checkpoint = torch.load(CONFIG["model_koopman_path"], map_location=device)
+            if "val_indices" not in checkpoint:
+                print("Error: 'val_indices' not found in checkpoint.")
+                return
+
+            val_indices = checkpoint["val_indices"]
+            if isinstance(val_indices, torch.Tensor):
+                val_indices = val_indices.cpu().numpy()
+
+            if val_indices_path is not None:
+                os.makedirs(os.path.dirname(val_indices_path), exist_ok=True)
+                np.save(val_indices_path, val_indices)
+                print(f"Saved fixed val_indices to: {val_indices_path} (N={len(val_indices)})")
+
             
         route_arr = route_arr_full[val_indices]
         time_arr = time_arr_full[val_indices]
@@ -561,20 +585,59 @@ def main():
         # ここではDataFrame用のmetrics_listに、サンプルごとの平均値として埋め込みます
         # (詳細な分布を見たい場合は別途 stay_results を保存してください)
         
-        def summarize_stay(metrics_list):
-            if not metrics_list: return None, None, None
+        # ===============================================
+        # 修正: 統合コスト計算を含む集計関数
+        # ===============================================
+        def summarize_stay(metrics_list, alpha=1.5, dist_thresh=3):
+            """
+            alpha: 空間誤差1ホップを、時間誤差何ステップ分に換算するか (1.5)
+            dist_thresh: これを超えて場所が離れていたら、時間誤差を無視してペナルティ化 (Pattern Y)
+            """
+            if not metrics_list: return None, None, None, None, None
             
-            # 検出できたものだけを対象に距離平均などを計算
+            # 検出できたものだけを対象
             detected = [m for m in metrics_list if m['detected']]
-            if not detected: return 0.0, None, None # 検出率0
+            if not detected: return 0.0, None, None, None, None
             
             det_rate = len(detected) / len(metrics_list)
-            mean_len_diff = np.mean([m['len_diff'] for m in detected])
-            mean_loc_dist = np.mean([m['loc_dist'] for m in detected])
-            return det_rate, mean_len_diff, mean_loc_dist
+            
+            # 1. 既存指標
+            diffs = [m['len_diff'] for m in detected]
+            dists = [m['loc_dist'] for m in detected]
+            
+            mean_len_diff = np.mean(diffs)          # Bias
+            mean_len_abs  = np.mean(np.abs(diffs))  # Abs Error
+            mean_loc_dist = np.mean(dists)          # Loc Error
+            
+            # 2. ★新規: 統合コスト (Integrated Cost) の計算
+            costs = []
+            for m in detected:
+                d = m['loc_dist']
+                abs_l = abs(m['len_diff'])
+                
+                # パターンY: 足切りロジック
+                if d > dist_thresh:
+                    # 場所が遠すぎる(>2hop)場合、時間の正確さは無意味とみなす。
+                    # 時間誤差として「正解の滞在時間そのもの(全ミス)」をペナルティ採用
+                    # これにより「遠い場所で偶然時間が合った」ケースを排除
+                    time_cost = m['gt_dur'] 
+                else:
+                    # 場所が許容範囲なら、実際の時間誤差を採用
+                    time_cost = abs_l
+                
+                # Cost = 時間コスト + (重み * 空間コスト)
+                # 例: 距離2hop, 時間誤差0 -> Cost = 0 + 1.5*2 = 3.0
+                # 例: 距離3hop, 時間誤差0 -> Cost = gt_dur(例:5) + 1.5*3 = 9.5 (大ペナルティ)
+                cost = time_cost + (alpha * d)
+                costs.append(cost)
+            
+            mean_cost = np.mean(costs)
+            
+            return det_rate, mean_len_diff, mean_len_abs, mean_loc_dist, mean_cost
 
-        k_rate, k_ldiff, k_loc = summarize_stay(stay_metrics_k)
-        a_rate, a_ldiff, a_loc = summarize_stay(stay_metrics_a)
+        # 変数の受け取り (5つに増加)
+        k_rate, k_ldiff, k_labs, k_loc, k_cost = summarize_stay(stay_metrics_k)
+        a_rate, a_ldiff, a_labs, a_loc, a_cost = summarize_stay(stay_metrics_a)
 
         metrics_list.append({
             'id': idx, 'len': gen_len,
@@ -589,14 +652,18 @@ def main():
             'k_gdtw': calc_dtw(gt_future, pred_k, geo=True),
             'a_gdtw': calc_dtw(gt_future, pred_a, geo=True),
             'prompt': prompt_seq, 'gt': gt_future, 'pred_k': pred_k, 'pred_a': pred_a,
-            'k_stay_rate': k_rate if k_rate is not None else np.nan, # 滞在検出率
-            'k_stay_len_diff': k_ldiff if k_ldiff is not None else np.nan, # 長さ誤差(Pred-GT)
-            'k_stay_dist': k_loc if k_loc is not None else np.nan, # 場所誤差(Hop)
+            # ★ 滞在指標 (Absを追加)
+            'k_stay_rate': k_rate if k_rate is not None else np.nan,
+            'k_stay_len_diff': k_ldiff if k_ldiff is not None else np.nan,
+            'k_stay_len_abs':  k_labs  if k_labs  is not None else np.nan,
+            'k_stay_dist': k_loc if k_loc is not None else np.nan,
+            'k_stay_cost': k_cost if k_cost is not None else np.nan, # New
             
             'a_stay_rate': a_rate if a_rate is not None else np.nan,
             'a_stay_len_diff': a_ldiff if a_ldiff is not None else np.nan,
+            'a_stay_len_abs':  a_labs  if a_labs  is not None else np.nan,
             'a_stay_dist': a_loc if a_loc is not None else np.nan,
-            
+            'a_stay_cost': a_cost if a_cost is not None else np.nan, # New
             'prompt': prompt_seq, 'gt': gt_future, 'pred_k': pred_k, 'pred_a': pred_a
         })
 
@@ -634,17 +701,20 @@ def main():
         print("  [Stay Metrics] (Detected Stays Only)")
         print(f"    Detection Rate:     Koopman={d['k_stay_rate'].mean():.4f} | Ablation={d['a_stay_rate'].mean():.4f}")
         print(f"    Length Diff (avg):  Koopman={d['k_stay_len_diff'].mean():.4f} | Ablation={d['a_stay_len_diff'].mean():.4f}")
+        print(f"    Length Diff (Abs):  Koopman={d['k_stay_len_abs'].mean():.4f}  | Ablation={d['a_stay_len_abs'].mean():.4f}")
         print(f"    Loc Dist (hops):    Koopman={d['k_stay_dist'].mean():.4f}     | Ablation={d['a_stay_dist'].mean():.4f}")
+        print(f"    Integrated Cost:    Koopman={d['k_stay_cost'].mean():.4f}     | Ablation={d['a_stay_cost'].mean():.4f}")
+        print("    (Cost: Lower is better. 0=Perfect. Includes penalty for dist > 3 hops)")
 
-    df_short = df[df['len'] <= 9]
-    df_long  = df[df['len'] > 9]
+    df_short = df[df['len'] <= 8]
+    df_long  = df[df['len'] > 8]
 
     print("\n" + "="*50)
     print("Evaluation Summary")
     print("="*50)
     print_metrics("Overall", df)
-    print_metrics("Short Term (<= 9 steps)", df_short)
-    print_metrics("Long Term (> 9 steps)", df_long)
+    print_metrics("Short Term (<= 8 steps)", df_short)
+    print_metrics("Long Term (> 8 steps)", df_long)
     print("-" * 50)
     
     # =====================================================
