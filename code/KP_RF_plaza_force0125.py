@@ -27,7 +27,8 @@ TARGETS = [
 
 # 出力先
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUT_DIR = f"/home/mizutani/projects/RF/runs/20260124_214854/plaza_force"
+# パス設定はユーザー環境に合わせて適宜変更してください
+OUT_DIR = f"/home/mizutani/projects/RF/runs/20260124_214854/plaza_force_{run_id}"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # データパス
@@ -124,6 +125,103 @@ def load_model_safe(path, network, base_N, dist_mat):
     model.to(DEVICE)
     model.eval()
     return model, c
+
+# =========================================================
+#  Analysis Part 0: Delta Logits (Global Effect)
+# =========================================================
+
+def analyze_delta_logits(model, network, out_dir):
+    """
+    広場埋め込み(Event=1)が、Event=0に対して各ノードへの遷移ロジットをどう変化させるかを可視化
+    Delta Logits = W_out * B * (u_on - u_off)
+    これは現在の状態や滞在ステップ数に依存しない定数ベクトルとなる。
+    """
+    print("Analyzing Delta Logits (Global Plaza Effect)...")
+    
+    # 1. 入力埋め込みの差分 (Delta u) を構築
+    # u = [token, stay, agent, holiday, timezone, event]
+    # 他の要素は共通なので差分をとると消える。Event部分の差分だけが残る。
+    
+    # Event Embeddings
+    evt_off = torch.tensor([0], device=DEVICE)
+    evt_on  = torch.tensor([1], device=DEVICE)
+    
+    emb_off = model.event_embedding(evt_off) # [1, emb_dim]
+    emb_on  = model.event_embedding(evt_on)  # [1, emb_dim]
+    
+    delta_evt = emb_on - emb_off # [1, emb_dim]
+    
+    # 全入力次元における差分ベクトルを作成
+    # 構造: [Token(D_tok), Stay(D_stay), Agent(D_ag), Hol(D_hol), Tz(D_tz), Event(D_evt)]
+    # Eventは末尾にあると仮定（KoopmanRoutesFormerの実装順序準拠）
+    
+    # 各エンベディングの次元を取得
+    d_tok = model.token_embedding.embedding_dim
+    d_stay = model.stay_embedding.embedding_dim
+    d_ag = model.agent_embedding.embedding_dim
+    d_hol = model.holiday_embedding.embedding_dim
+    d_tz = model.time_zone_embedding.embedding_dim
+    d_evt = model.event_embedding.embedding_dim
+    
+    # ゼロパディングを作成
+    zeros_prefix_dim = d_tok + d_stay + d_ag + d_hol + d_tz
+    zeros_prefix = torch.zeros((1, zeros_prefix_dim), device=DEVICE)
+    
+    # Delta u: [1, total_input_dim]
+    delta_u = torch.cat([zeros_prefix, delta_evt], dim=-1)
+    
+    # 2. Delta Logits の計算
+    # Logits = W * z + b
+    # z_next = A*z + B*u
+    # Delta Logits = W * (B * delta_u)  (バイアス項やA*z項はキャンセルされる)
+    
+    B_mat = model.B # [z_dim, input_dim]
+    W_out = model.to_logits.weight # [vocab_size, z_dim]
+    
+    # delta_z = delta_u @ B^T  => [1, z_dim]
+    delta_z = F.linear(delta_u, B_mat)
+    
+    # delta_logits = delta_z @ W^T => [1, vocab_size]
+    delta_logits = F.linear(delta_z, W_out).detach().cpu().numpy().flatten()
+    
+    # 3. 可視化
+    vocab_size = len(delta_logits)
+    indices = np.arange(vocab_size)
+    
+    # ラベル作成 helper
+    tokenizer = Tokenization(network)
+    def get_label(idx):
+        if idx in tokenizer.SPECIAL_TOKENS.values():
+            for k, v in tokenizer.SPECIAL_TOKENS.items():
+                if v == idx: return k
+        return str(idx)
+        
+    labels = [get_label(i) for i in indices]
+    
+    plt.figure(figsize=(15, 6))
+    
+    # 棒グラフで表示
+    # 正の値：確率を上げる方向、負の値：確率を下げる方向
+    bars = plt.bar(indices, delta_logits, color='skyblue', edgecolor='black')
+    
+    # 0ライン
+    plt.axhline(0, color='gray', linewidth=0.8)
+    
+    plt.title("Impact of Plaza Embedding on Logits (Delta Logits)\n(Positive = Increased Transition Probability)", fontsize=14)
+    plt.xlabel("Token ID (Target Node)", fontsize=12)
+    plt.ylabel("Change in Logits", fontsize=12)
+    plt.xticks(indices, labels, rotation=90, fontsize=8)
+    plt.xlim(-1, vocab_size)
+    
+    # グリッド
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, "plaza_effect_delta_logits.png")
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved Delta Logits visualization to {save_path}")
+
 
 # =========================================================
 #  Analysis Part 1: Input Forcing Diff (Bu)
@@ -233,8 +331,6 @@ def analyze_forcing_diff(model, target, schur, out_dir):
 def analyze_forcing_decomposition(model, target, schur, out_dir):
     """
     Buを「Base成分（場所・滞在・時間など）」と「Event成分」に分解して可視化する。
-    これにより、Event ON/OFFの差が見にくい問題を解決し、
-    「元々どういう力が働いていて(Base)」「イベントが何を足したか(Event)」を可視化する。
     """
     stay_token = target["stay_token"]
     name = target["name"]
@@ -249,12 +345,6 @@ def analyze_forcing_decomposition(model, target, schur, out_dir):
     agent_t = torch.tensor([0], device=DEVICE)
     holiday_t = torch.tensor([1], device=DEVICE)
     time_t = torch.tensor([0], device=DEVICE)
-    
-    # ゼロベクトル（パディング埋め込み相当）を用意
-    # ※モデルのpadding_idx=38等を使ってゼロ埋め込みを作る
-    # ここでは簡易的に「Event=0 (OFF)」を基準(Zero)とみなして差分をとる戦略でいく
-    # Base Force = Bu(Event=OFF)
-    # Event Force = Bu(Event=ON) - Bu(Event=OFF)
     
     norms_base = []
     norms_event = []
@@ -287,10 +377,10 @@ def analyze_forcing_decomposition(model, target, schur, out_dir):
             u_total_np = u_total.cpu().numpy().flatten()
             
             # --- 3. Calculate Forces ---
-            # Base Force: 場所や滞在時間などが生み出す本来の力
+            # Base Force
             Bu_base = u_base_np @ B_np.T
             
-            # Event Force: イベントによって追加される純粋な力 (線形性より差分と等価)
+            # Event Force (Diff)
             Bu_event = u_total_np @ B_np.T - Bu_base
             
             # Project to Schur
@@ -305,10 +395,6 @@ def analyze_forcing_decomposition(model, target, schur, out_dir):
     norms_event = np.array(norms_event).T # [NumBlocks, Steps]
     
     yticklabels = [b["desc"] for b in schur.blocks]
-    
-    # Plot
-    # BaseとEventではエネルギーの桁が違う可能性があるため、スケールは個別に設定する
-    # Base: 大きな力, Event: 小さなバイアス
     
     fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
     
@@ -329,7 +415,6 @@ def analyze_forcing_decomposition(model, target, schur, out_dir):
     save_path = os.path.join(out_dir, f"forcing_decomp_{name}.png")
     plt.savefig(save_path)
     plt.close()
-    print(f"Saved forcing decomposition to {save_path}")
 
 # =========================================================
 #  Analysis Part 2: Time-Series Contribution Analysis
@@ -337,9 +422,9 @@ def analyze_forcing_decomposition(model, target, schur, out_dir):
 
 def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, out_dir):
     """
-    対象ノードを「経由」した経路全体の時系列分析 (Version 3: Fixed Alignment)
+    対象ノードを「経由」した経路全体の時系列分析 (Version 4: z_pred_next visualization)
     Step 0(Start)を除外し、Step 1以降について、
-    [Current Input] -> [Z] -> [Contrib to Next] -> [Next Prob]
+    [Current Input] -> [z_pred_next] -> [Contrib to Next] -> [Next Prob]
     の順で可視化する。
     """
     routes = dataset_dict["routes"]
@@ -406,8 +491,6 @@ def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, 
         e_b  = torch.tensor(events[r_idx][:len(path)], dtype=torch.long).unsqueeze(0).to(DEVICE)
         
         # Tokenize (align context)
-        # inp_tokens: [<b>, Node1, Node2, ...] (Length T)
-        # tgt_tokens: [Node1, Node2, <e>, ...] (Length T)
         inp_tokens = tokenizer.tokenization(rt_b, mode="simple").long().to(DEVICE)
         tgt_tokens = tokenizer.tokenization(rt_b, mode="next").long().to(DEVICE)
         stay_counts = tokenizer.calculate_stay_counts(inp_tokens)
@@ -425,15 +508,19 @@ def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, 
         
         # Forward
         with torch.no_grad():
-            logits_seq, z_hat, _, _ = model(inp_tokens, stay_counts, ag_b, h_in, tz_in, e_in)
-            z_seq = z_hat[0].cpu().numpy() # [T, z_dim]
+            # ★変更: 返り値を正しく受け取る
+            # (logits, z_hat, z_pred_next, u_all)
+            logits_seq, z_hat, z_pred_next, _ = model(inp_tokens, stay_counts, ag_b, h_in, tz_in, e_in)
+            
+            # ★変更: 可視化対象を z_pred_next にする
+            # z_pred_next[t] は input[t] に対する「次ステップ予測状態」
+            z_seq = z_pred_next[0].cpu().numpy() # [T, z_dim]
+            
             probs_seq = F.softmax(logits_seq[0], dim=-1).cpu().numpy() # [T, Vocab]
             
-        # --- Time-Series Analysis Data Prep (Modified for Fixed Alignment) ---
+        # --- Time-Series Analysis Data Prep ---
         
         # Step 0 (Start <b>) はカットする。t=1から開始。
-        # t=1: Input=Node1, z=z_hat[1], Target=Node2 (or End)
-        
         plot_indices = range(1, T) # 1, 2, ..., T-1
         
         # Data Accumulators
@@ -450,13 +537,12 @@ def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, 
         for t in plot_indices:
             # 1. Labels (Current Input)
             curr_token = inp_np[t]
-            # パディング(38)ならそこで打ち切り
-            if curr_token == 38: 
-                break
-                
+            if curr_token == 38: break
             labels_list.append(curr_token)
             
             # 2. Z Dynamics (Current Z)
+            # ここでの z_seq[t] は z_pred_next[t]
+            # つまり、input[t] を受けて予測された「次の状態」
             z_t = z_seq[t]
             z_t_schur = schur.transform(z_t)
             z_norms = schur.get_block_norms(z_t_schur).flatten()
@@ -466,12 +552,9 @@ def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, 
             target_token = tgt_np[t]
             ground_truth_list.append(target_token)
             
-            # targetがパディングの場合は計算しない
             if target_token == 38:
-                # ここに来ることは基本ないはずだが念のためゼロ埋め
                 contrib_list.append(np.zeros(len(schur.blocks)))
             else:
-                # ターゲットが<e>でも計算する
                 step_contribs = []
                 for b in schur.blocks:
                     idx = b["idx"]
@@ -485,22 +568,20 @@ def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, 
             # 4. Probability (Next Prob)
             probs_list.append(probs_seq[t])
 
-        # Convert to Numpy for Heatmap [Steps, Features] -> Transpose later [Features, Steps]
+        # Convert to Numpy
         z_norms_arr = np.array(z_norms_list)
         contrib_arr = np.array(contrib_list)
         probs_arr = np.array(probs_list)
         
-        if len(z_norms_arr) == 0: continue # データがない場合スキップ
+        if len(z_norms_arr) == 0: continue
         
-        # Probability Display Range
         vocab_to_plot = network.N + 5
-        probs_plot = probs_arr[:, :vocab_to_plot] # [Steps, Vocab]
+        probs_plot = probs_arr[:, :vocab_to_plot]
 
         # --- Plotting ---
         def get_token_label(tok):
             if tok == target_stay_token: return f"[{tok}]" 
             if tok in tokenizer.SPECIAL_TOKENS.values(): 
-                # Reverse lookup for display
                 for k, v in tokenizer.SPECIAL_TOKENS.items():
                     if v == tok: return k
                 return "*"
@@ -514,7 +595,7 @@ def run_trajectory_analysis_series(model, network, dataset_dict, target, schur, 
         
         # 1. Z Dynamics (Top)
         sns.heatmap(z_norms_arr.T, ax=axes[0], cmap="viridis", cbar_kws={'label': 'Z Energy'})
-        axes[0].set_title(f"Sample {r_idx}: Latent State Z Dynamics (Event={'ON' if is_evt else 'OFF'})")
+        axes[0].set_title(f"Sample {r_idx}: Predicted Next State (z_pred_next) Dynamics (Event={'ON' if is_evt else 'OFF'})")
         axes[0].set_ylabel("Schur Mode")
         axes[0].set_yticks(np.arange(len(yticklabels))+0.5)
         axes[0].set_yticklabels(yticklabels, rotation=0)
@@ -582,17 +663,20 @@ def main():
     A_np = model.A.detach().cpu().numpy()
     schur = SchurAnalyzer(A_np)
     
+    # 0. Global Plaza Effect (Delta Logits)
+    # ターゲットやサンプルに依存しないため、最初に1回だけ実行
+    analyze_delta_logits(model, network, OUT_DIR)
+    
     # Run Analysis for each target
     for target in TARGETS:
-        # 1. Forcing Diff (Fixed Scale, Compressed Steps)
-
+        # 1. Forcing Diff
         analyze_forcing_diff(model, target, schur, OUT_DIR)
         analyze_forcing_decomposition(model, target, schur, OUT_DIR)
         
-        # 2. Trajectory Series Analysis (Fixed Alignment, 3-layer plot)
+        # 2. Trajectory Series Analysis
         run_trajectory_analysis_series(model, network, dataset_dict, target, schur, OUT_DIR)
         
-    print(f"Deep Analysis V3 (Fixed) Completed. Saved to {OUT_DIR}")
+    print(f"Deep Analysis V4 (Plaza Effect) Completed. Saved to {OUT_DIR}")
 
 if __name__ == "__main__":
     main()

@@ -168,6 +168,9 @@ class KoopmanRoutesFormer(nn.Module):
         )
         z_hat = self.to_z(h) # [B, T, z_dim]
 
+        ###=====================###
+        ###=Butの入力省略変更箇所1=###
+        ###=====================###
         # Batch Dynamics
         z_pred_next = (
             torch.einsum("ij,btj->bti", self.A, z_hat) + 
@@ -214,7 +217,10 @@ class KoopmanRoutesFormer(nn.Module):
         
         term_A = torch.matmul(z_curr, self.A.t()) # [B, z_dim]
         term_B = torch.matmul(u_curr, self.B.t()) # [B, z_dim]
-        
+        ###=====================###
+        ###=Butの入力省略変更箇所1=###
+        ###=====================###
+
         z_next = term_A + term_B
         logits = self.to_logits(z_next)
         

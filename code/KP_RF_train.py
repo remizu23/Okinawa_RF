@@ -37,7 +37,7 @@ wandb.config = type("C", (), {
     "savefilename": "model_weights.pth",
     
     # Ablation
-    "use_koopman_loss": True,  
+    "use_koopman_loss": False,  
     "koopman_alpha": 0.1,
     
     # ★ Rollout設定
@@ -54,7 +54,7 @@ def stamp(name): return os.path.join(out_dir, name)
 
 # --- データの準備 ---
 # ※パスは適宜環境に合わせてください
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5.npz') 
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5long.npz') 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
 # 距離行列計算 (省略可能だが元のコードに従う)
@@ -538,8 +538,8 @@ for epoch in range(wandb.config.epochs):
                         wandb.config.koopman_alpha * loss_k + \
                         0.1 * loss_mode + \
                         0.01 * loss_count + \
-                        wandb.config.koopman_alpha * loss_rollout + \
-                        geo_alpha * loss_geo
+                        wandb.config.koopman_alpha * loss_rollout
+                        # geo_alpha * loss_geo
                         # 1 * loss_dyn + \
 
         optimizer.zero_grad()
@@ -731,8 +731,8 @@ for epoch in range(wandb.config.epochs):
                         wandb.config.koopman_alpha * loss_k + \
                         wandb.config.koopman_alpha * loss_rollout + \
                         0.01 * loss_count + \
-                        0.1 * loss_mode + \
-                        geo_alpha * loss_geo
+                        0.1 * loss_mode
+                        # geo_alpha * loss_geo
                         # 1 * loss_dyn + \
 
             epoch_metrics_val["loss"] += loss_total.item()
@@ -802,19 +802,19 @@ try:
     ax.grid(True)
     
     # 2. Cross Entropy (Next Token) Loss
-    # ax = axes[0, 1]
-    # ax.plot(epochs_range, history["train_ce"], label='Train', marker='.', color='orange')
-    # ax.plot(epochs_range, history["val_ce"], label='Val', marker='.', color='red')
-    # ax.set_title('Next Token Prediction (CE Loss)')
-    # ax.legend()
-    # ax.grid(True)
-
     ax = axes[0, 1]
-    ax.plot(epochs_range, history["train_geo"], label='Train', marker='.', color='orange')
-    ax.plot(epochs_range, history["val_geo"], label='Val', marker='.', color='red')
-    ax.set_title('Geo CE Loss')
+    ax.plot(epochs_range, history["train_ce"], label='Train', marker='.', color='orange')
+    ax.plot(epochs_range, history["val_ce"], label='Val', marker='.', color='red')
+    ax.set_title('Next Token Prediction (CE Loss)')
     ax.legend()
     ax.grid(True)
+
+    # ax = axes[0, 1]
+    # ax.plot(epochs_range, history["train_geo"], label='Train', marker='.', color='orange')
+    # ax.plot(epochs_range, history["val_geo"], label='Val', marker='.', color='red')
+    # ax.set_title('Geo CE Loss')
+    # ax.legend()
+    # ax.grid(True)
     
     # 3. Dynamics Loss (Multi-step)
     ax = axes[0, 2]

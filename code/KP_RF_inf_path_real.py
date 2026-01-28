@@ -37,10 +37,10 @@ CONFIG = {
     "test_npz_path": "/home/mizutani/projects/RF/data/input_real_test_m4_emb.npz",
 
     # モデルパス
-    "model_koopman_path": "/home/mizutani/projects/RF/runs/20260125_010543/model_weights_20260125_010543.pth",
+    "model_koopman_path": "/home/mizutani/projects/RF/runs/20260124_214854/model_weights_20260124_214854.pth",
     "model_ablation_path": "/home/mizutani/projects/RF/runs/20260124_184039/model_weights_20260124_184039.pth",
     # 出力設定⭐︎変更忘れない！
-    "output_dir": "/home/mizutani/projects/RF/runs/20260125_010543/eval_m5val_もう一回",
+    "output_dir": "/home/mizutani/projects/RF/runs/20260124_214854/eval_m5val_自己回帰",
     "plot_max_samples": 1000,
 
     "val_indices_path": "/home/mizutani/projects/RF/data/common_val_m5.npy",
@@ -288,82 +288,156 @@ class ModelEvaluator:
         likelihood = probs[target_token].item()
         return is_correct, likelihood
 
+    ###=====================###
+    ### 0125 koopman側も逐次transformerに入れて自己回帰生成するver作成 ###
+    ###=====================###
     def generate_trajectory(self, prompt_seq, start_time, agent_id_raw, gen_len):
+        # 1. 初期プロンプトのコンテキスト作成
+        # プロンプト系列全体の時刻依存コンテキストを用意する
+        h_seq = []
+        tz_seq = []
+        e_seq = []
+        
+        # 時刻計算用 (1分刻みと仮定するか、データの仕様に合わせる)
+        # ※簡易的に「系列長分だけ進む」あるいは「固定」など、Ablation側のロジックに準拠します
+        # 厳密には prompt_seq の各時点の時刻が必要ですが、
+        # ここでは start_time からの相対経過、あるいは固定値(h_val, tz_val)を使っている既存ロジックを踏襲します。
+        
         h_val = self.context_logic.get_holiday(start_time)
         tz_val = self.context_logic.get_timezone(start_time)
         
+        # プロンプト部分のコンテキスト配列作成
         prompt_h = [h_val] * len(prompt_seq)
         prompt_tz = [tz_val] * len(prompt_seq)
         prompt_e = [self.context_logic.get_event(start_time, t) for t in prompt_seq]
         
-        tokens_in = torch.tensor([prompt_seq], dtype=torch.long, device=self.device)
-        h_in = torch.tensor([prompt_h], dtype=torch.long, device=self.device)
-        tz_in = torch.tensor([prompt_tz], dtype=torch.long, device=self.device)
-        e_in = torch.tensor([prompt_e], dtype=torch.long, device=self.device)
-        stay_counts_in = self.calculate_stay_counts(tokens_in)
-
+        # 2. Tensor化 (Batchサイズ 1)
+        curr_seq = torch.tensor([prompt_seq], dtype=torch.long, device=self.device)
+        curr_h = torch.tensor([prompt_h], dtype=torch.long, device=self.device)
+        curr_tz = torch.tensor([prompt_tz], dtype=torch.long, device=self.device)
+        curr_e = torch.tensor([prompt_e], dtype=torch.long, device=self.device)
+        
+        # エージェントID
         num_agents_model = self.model.agent_embedding.num_embeddings
         safe_agent_id = agent_id_raw % num_agents_model
         agent_in = torch.tensor([safe_agent_id], dtype=torch.long, device=self.device)
         
         generated_seq = []
         
-        with torch.no_grad():
-            logits, z_hat_seq, _, _ = self.model(
-                tokens_in, stay_counts_in, agent_in, h_in, tz_in, e_in
+        # 3. 生成ループ (Autoregressive)
+        # KoopmanモデルもAblationモデルも、ここで「逐次Transformer」を行う
+        for _ in range(gen_len):
+            # 現在の系列から滞在カウントを計算
+            curr_stay = self.calculate_stay_counts(curr_seq)
+            
+            # Forward Pass
+            # Koopmanモデルの場合: 
+            #   内部で Transformer -> z_t -> A z_t (+ B u_t) -> z_t+1 -> logits
+            #   という計算が行われ、"次の1ステップ" が予測される。
+            logits, _, _, _ = self.model(
+                curr_seq, curr_stay, agent_in, curr_h, curr_tz, curr_e
             )
             
-            if self.is_koopman:
-                z_curr = z_hat_seq[:, -1, :]
-                current_token = prompt_seq[-1]
-                current_stay_count = stay_counts_in[0, -1].item()
-                
-                for _ in range(gen_len):
-                    e_val = self.context_logic.get_event(start_time, current_token)
-                    u_t = self.get_embeddings(
-                        current_token, current_stay_count, safe_agent_id,
-                        h_val, tz_val, e_val
-                    ).squeeze(1)
-                    
-                    term_A = torch.matmul(z_curr, self.model.A.t())
-                    term_B = torch.matmul(u_t, self.model.B.t())
-                    z_next = term_A + term_B
-                    
-                    logits_next = self.model.to_logits(z_next)
-                    next_token = torch.argmax(logits_next, dim=-1).item()
-                    generated_seq.append(next_token)
-                    
-                    if next_token == current_token:
-                        current_stay_count += 1
-                        if current_stay_count >= self.model.stay_embedding.num_embeddings:
-                            current_stay_count = self.model.stay_embedding.num_embeddings - 1
-                    else:
-                        current_stay_count = 1
-                    current_token = next_token
-                    z_curr = z_next
-            else:
-                curr_seq = tokens_in
-                curr_h = h_in
-                curr_tz = tz_in
-                curr_e = e_in
-                curr_stay = stay_counts_in
-                
-                for _ in range(gen_len):
-                    logits, _, _, _ = self.model(
-                        curr_seq, curr_stay, agent_in, curr_h, curr_tz, curr_e
-                    )
-                    next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
-                    generated_seq.append(next_token)
-                    
-                    next_tens = torch.tensor([[next_token]], device=self.device)
-                    curr_seq = torch.cat([curr_seq, next_tens], dim=1)
-                    
-                    e_val = self.context_logic.get_event(start_time, next_token)
-                    curr_h = torch.cat([curr_h, torch.tensor([[h_val]], device=self.device)], dim=1)
-                    curr_tz = torch.cat([curr_tz, torch.tensor([[tz_val]], device=self.device)], dim=1)
-                    curr_e = torch.cat([curr_e, torch.tensor([[e_val]], device=self.device)], dim=1)
-                    curr_stay = self.calculate_stay_counts(curr_seq)
+            # 次のトークンを決定 (Greedy)
+            # ※確率的サンプリングが必要ならここを修正
+            next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
+            generated_seq.append(next_token)
+            
+            # 4. 次のステップへの入力作成
+            # トークン追加
+            next_tens = torch.tensor([[next_token]], device=self.device)
+            curr_seq = torch.cat([curr_seq, next_tens], dim=1)
+            
+            # コンテキスト追加
+            # 厳密な時刻更新が必要ならここで start_time を更新するが、
+            # 既存コードに従い、Holiday/Timezoneは固定、Eventはノード依存で判定
+            e_val = self.context_logic.get_event(start_time, next_token)
+            
+            curr_h = torch.cat([curr_h, torch.tensor([[h_val]], device=self.device)], dim=1)
+            curr_tz = torch.cat([curr_tz, torch.tensor([[tz_val]], device=self.device)], dim=1)
+            curr_e = torch.cat([curr_e, torch.tensor([[e_val]], device=self.device)], dim=1)
+
         return generated_seq
+    # def generate_trajectory(self, prompt_seq, start_time, agent_id_raw, gen_len):
+    #     h_val = self.context_logic.get_holiday(start_time)
+    #     tz_val = self.context_logic.get_timezone(start_time)
+        
+    #     prompt_h = [h_val] * len(prompt_seq)
+    #     prompt_tz = [tz_val] * len(prompt_seq)
+    #     prompt_e = [self.context_logic.get_event(start_time, t) for t in prompt_seq]
+        
+    #     tokens_in = torch.tensor([prompt_seq], dtype=torch.long, device=self.device)
+    #     h_in = torch.tensor([prompt_h], dtype=torch.long, device=self.device)
+    #     tz_in = torch.tensor([prompt_tz], dtype=torch.long, device=self.device)
+    #     e_in = torch.tensor([prompt_e], dtype=torch.long, device=self.device)
+    #     stay_counts_in = self.calculate_stay_counts(tokens_in)
+
+    #     num_agents_model = self.model.agent_embedding.num_embeddings
+    #     safe_agent_id = agent_id_raw % num_agents_model
+    #     agent_in = torch.tensor([safe_agent_id], dtype=torch.long, device=self.device)
+        
+    #     generated_seq = []
+        
+    #     with torch.no_grad():
+    #         logits, z_hat_seq, _, _ = self.model(
+    #             tokens_in, stay_counts_in, agent_in, h_in, tz_in, e_in
+    #         )
+            
+    #         if self.is_koopman:
+    #             z_curr = z_hat_seq[:, -1, :]
+    #             current_token = prompt_seq[-1]
+    #             current_stay_count = stay_counts_in[0, -1].item()
+                
+    #             for _ in range(gen_len):
+    #                 e_val = self.context_logic.get_event(start_time, current_token)
+    #                 u_t = self.get_embeddings(
+    #                     current_token, current_stay_count, safe_agent_id,
+    #                     h_val, tz_val, e_val
+    #                 ).squeeze(1)
+                    
+    #                 ###=====================###
+    #                 ###=Butの入力省略変更箇所1=###
+    #                 ###=====================###
+
+    #                 term_A = torch.matmul(z_curr, self.model.A.t())
+    #                 term_B = torch.matmul(u_t, self.model.B.t())
+    #                 z_next = term_A + term_B
+                    
+    #                 logits_next = self.model.to_logits(z_next)
+    #                 next_token = torch.argmax(logits_next, dim=-1).item()
+    #                 generated_seq.append(next_token)
+                    
+    #                 if next_token == current_token:
+    #                     current_stay_count += 1
+    #                     if current_stay_count >= self.model.stay_embedding.num_embeddings:
+    #                         current_stay_count = self.model.stay_embedding.num_embeddings - 1
+    #                 else:
+    #                     current_stay_count = 1
+    #                 current_token = next_token
+    #                 z_curr = z_next
+    #         else:
+    #             curr_seq = tokens_in
+    #             curr_h = h_in
+    #             curr_tz = tz_in
+    #             curr_e = e_in
+    #             curr_stay = stay_counts_in
+                
+    #             for _ in range(gen_len):
+    #                 logits, _, _, _ = self.model(
+    #                     curr_seq, curr_stay, agent_in, curr_h, curr_tz, curr_e
+    #                 )
+    #                 next_token = torch.argmax(logits[:, -1, :], dim=-1).item()
+    #                 generated_seq.append(next_token)
+                    
+    #                 next_tens = torch.tensor([[next_token]], device=self.device)
+    #                 curr_seq = torch.cat([curr_seq, next_tens], dim=1)
+                    
+    #                 e_val = self.context_logic.get_event(start_time, next_token)
+    #                 curr_h = torch.cat([curr_h, torch.tensor([[h_val]], device=self.device)], dim=1)
+    #                 curr_tz = torch.cat([curr_tz, torch.tensor([[tz_val]], device=self.device)], dim=1)
+    #                 curr_e = torch.cat([curr_e, torch.tensor([[e_val]], device=self.device)], dim=1)
+    #                 curr_stay = self.calculate_stay_counts(curr_seq)
+    #     return generated_seq
 
 def calc_dtw(seq1, seq2, geo=False):
     n, m = len(seq1), len(seq2)
