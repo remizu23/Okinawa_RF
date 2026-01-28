@@ -23,7 +23,7 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 200, 
+    "epochs": 100, 
     "batch_size": 32, 
     "d_ie": 64,
     "head_num": 4, 
@@ -38,13 +38,16 @@ wandb.config = type("C", (), {
     "event_emb_dim": 4,
 
     "savefilename": "model_weights.pth",
+
+    # ⭐︎end_tokenのCE重み
+    "end_token_weight": 2.0,
     
     # ★ Prefix設定（新規）
     "use_variable_prefix": False,      # 可変長Prefixを使うか（False=固定長）
-    "fixed_prefix_length": 8,        # 固定長の場合の長さ
+    "fixed_prefix_length": 5,        # 固定長の場合の長さ
 
     "prefix_lengths": [4, 6, 8],      # 可変長の場合の候補
-    "min_future_length": 4,           # Futureの最小長
+    "min_future_length": 3,           # Futureの最小長
     
     # ★ 補助損失の重み（新規）
     "aux_count_weight": 0.01,  # カウント復元損失の重み (0で無効化)
@@ -82,8 +85,8 @@ print(f"Output directory: {out_dir}")
 # ========================================
 
 print("\n=== Loading Data ===")
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5long.npz') 
-common_split_path = "/home/mizutani/projects/RF/data/common_split_indices_m5long.npz"
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5.npz') 
+common_split_path = "/home/mizutani/projects/RF/data/common_split_indices_m5.npz"
 
 adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
 
@@ -486,6 +489,14 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=wandb.config.learning_rate,
 # Tokenizer
 tokenizer = Tokenization(network)
 
+# --- <e> 重み（最小追加） ---
+END_WEIGHT = wandb.config.end_token_weight
+end_id = 39
+
+ce_class_weight = torch.ones(vocab_size, device=device, dtype=torch.float32)
+ce_class_weight[end_id] = float(END_WEIGHT)
+
+
 # ========================================
 # 学習ループ
 # ========================================
@@ -551,6 +562,7 @@ for epoch in range(wandb.config.epochs):
         ce_loss = nn.functional.cross_entropy(
             pred_logits.reshape(-1, vocab_size),
             future_tokens[:, :K].reshape(-1),
+            weight=ce_class_weight,
             reduction='none'
         )
         ce_loss = (ce_loss.view(-1, K) * valid_mask.float()).sum() / (valid_mask.sum() + 1e-8)
@@ -738,6 +750,9 @@ save_data = {
         "lyap_eps": wandb.config.lyap_eps,
         "use_variable_prefix": wandb.config.use_variable_prefix,
         "prefix_lengths": wandb.config.prefix_lengths,
+        "end_weight": float(END_WEIGHT),
+        "min_future_length":wandb.config.min_future_length,
+        "fixed_prefix_length":wandb.config.fixed_prefix_length
     },
     "history": history,
     "split_sequences": {

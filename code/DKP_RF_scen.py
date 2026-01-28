@@ -1,16 +1,6 @@
 """
-Koopman Mode Decomposition Analysis for DKP_RF (Original Model / No Jumps)
-
-旧モデル（Prefix-only encoding + Autonomous Koopman rollout）用の
-固有モード分解による解釈性検証コード
-
-主な機能：
-1. A行列の固有値分解と単位円上プロット
-2. 各ステップでの潜在状態z_tを固有空間射影
-3. 重みベクトルの固有空間寄与分析
-4. トークン選択確率と広場有無の差分可視化
-5. Greedy生成による5ステップ分の横並び可視化
-6. ★追加: Koopman Biplot (z軌跡とトークン重みの同時プロット)
+Koopman Mode Decomposition Analysis for DKP_RF (Original / No-Jump)
+With Biplot (Eigen-space & PCA), All-Token Display, and Auto-Scaling.
 """
 
 import torch
@@ -18,10 +8,9 @@ import numpy as np
 import scipy.linalg
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import seaborn as sns
+from sklearn.decomposition import PCA
 import os
 from datetime import datetime
-import torch.nn.functional as F
 
 # ユーザー定義モジュール
 from network import Network, expand_adjacency_matrix
@@ -33,16 +22,15 @@ from DKP_RF import KoopmanRoutesFormer
 #  Config & Settings
 # =========================================================
 
-# シナリオ定義
 SCENARIOS = [
     {
         "name": "0,1,2,21",
-        "prefix": [0, 1, 2, 21],  # 初期prefix
+        "prefix": [0, 1, 2, 21],
         "time": 20240101,
         "agent_id": 0,
         "holiday": 1,
         "time_zone": 0,
-        "plaza_node_tokens": [2, 21],  # 広場として扱うノード
+        "plaza_node_tokens": [2, 21],
     },
     {
         "name": "6,5,4,11",
@@ -58,36 +46,33 @@ SCENARIOS = [
         "prefix": [1, 5, 6, 14, 33],
         "time": 20240101,
         "agent_id": 0,
-        "holiday": 1,              
-        "time_zone": 0,            
+        "holiday": 1,
+        "time_zone": 0,
         "plaza_node_tokens": [14, 33]
     },
     {
         "name": "18,16,14",
         "prefix": [18, 16, 14, 33],
         "time": 20240101,
-        "holiday": 1,              
-        "time_zone": 0,            
+        "holiday": 1,
+        "time_zone": 0,
         "agent_id": 0,
         "plaza_node_tokens": [14, 33]
     },
 ]
 
-# パス設定（環境に合わせて変更してください）
-MODEL_PATH = "/home/mizutani/projects/RF/runs/20260127_014201/model_weights_20260127_014201.pth"
+# パス設定
+MODEL_PATH = "/home/mizutani/projects/RF/runs/20260128_201544/model_weights_20260128_201544.pth"
 ADJ_PATH = "/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt"
 DATA_PATH = "/home/mizutani/projects/RF/data/input_real_m5.npz"
 
 # 出力先
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUT_DIR = os.path.join(os.path.dirname(MODEL_PATH), f"scen2_{RUN_ID}")
+OUT_DIR = os.path.join(os.path.dirname(MODEL_PATH), f"scen_{RUN_ID}")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# デバイス
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# 解析パラメータ
-NUM_ROLLOUT_STEPS = 30  # 何ステップ生成するか
+NUM_ROLLOUT_STEPS = 30
 
 
 # =========================================================
@@ -95,7 +80,6 @@ NUM_ROLLOUT_STEPS = 30  # 何ステップ生成するか
 # =========================================================
 
 def get_movable_tokens(current_node, adj_matrix, pad_token_id=38, end_token_id=39):
-    """現在位置から移動可能なトークンを取得"""
     if isinstance(adj_matrix, torch.Tensor):
         adj_np = adj_matrix.cpu().numpy()
     else:
@@ -104,12 +88,10 @@ def get_movable_tokens(current_node, adj_matrix, pad_token_id=38, end_token_id=3
     neighbors = np.where(adj_np[current_node] > 0)[0]
     movable_tokens = []
     
-    # Move tokens
     for neighbor in neighbors:
         if 0 <= neighbor <= 18:
             movable_tokens.append(int(neighbor))
     
-    # Stay tokens
     if 0 <= current_node <= 18:
         stay_token = current_node + 19
         movable_tokens.append(stay_token)
@@ -119,7 +101,6 @@ def get_movable_tokens(current_node, adj_matrix, pad_token_id=38, end_token_id=3
 
 
 def get_token_label(token_id, tokenizer):
-    """トークンIDからラベル文字列を取得"""
     if 0 <= token_id <= 18:
         return f"M{token_id}"
     elif 19 <= token_id <= 37:
@@ -138,7 +119,6 @@ def get_token_label(token_id, tokenizer):
 # =========================================================
 
 class KoopmanEigenAnalyzer:
-    """Koopman演算子Aの固有値分解と解析"""
     def __init__(self, model):
         self.model = model
         self.z_dim = model.z_dim
@@ -146,6 +126,7 @@ class KoopmanEigenAnalyzer:
         A_np = model.A.detach().cpu().numpy()
         eigvals, eigvecs = scipy.linalg.eig(A_np)
         
+        # 固有値の絶対値が大きい順にソート
         sort_idx = np.argsort(np.abs(eigvals))[::-1]
         self.eigvals = eigvals[sort_idx]
         self.V = eigvecs[:, sort_idx]
@@ -167,14 +148,11 @@ class KoopmanEigenAnalyzer:
         fig, ax = plt.subplots(figsize=(8, 8))
         theta = np.linspace(0, 2*np.pi, 200)
         ax.plot(np.cos(theta), np.sin(theta), 'k--', linewidth=1, alpha=0.3)
-        
         ax.scatter(self.eigvals.real, self.eigvals.imag, 
                   c=np.arange(len(self.eigvals)), cmap='coolwarm',
                   s=100, edgecolors='black', linewidth=1.5, zorder=5)
-        
         for i, ev in enumerate(self.eigvals):
             ax.annotate(f'λ{i}', (ev.real, ev.imag), xytext=(5, 5), textcoords='offset points', fontsize=8)
-        
         ax.set_xlabel('Real'); ax.set_ylabel('Imaginary')
         ax.set_title('Eigenvalues of Koopman Matrix A')
         ax.axhline(0, color='black', alpha=0.3); ax.axvline(0, color='black', alpha=0.3)
@@ -185,12 +163,291 @@ class KoopmanEigenAnalyzer:
 
 
 # =========================================================
+#  Visualization Functions (Biplot & PCA)
+# =========================================================
+
+def plot_tokens_on_ax(ax, token_vecs, token_indices, tokenizer, scale_factor, color='gray', alpha=0.6):
+    """
+    指定されたAxesにトークンをプロットするヘルパー関数
+    token_vecs: [N_tokens, 2] (X, Y座標)
+    """
+    texts = []
+    # 全トークンを表示 (0 ~ 39)
+    for idx in token_indices:
+        if idx >= len(token_vecs): continue
+        
+        vec = token_vecs[idx]
+        x, y = vec[0] * scale_factor, vec[1] * scale_factor
+        
+        # 点としてプロット
+        ax.plot(x, y, '.', color=color, markersize=3, alpha=alpha)
+        
+        # ラベル
+        label_txt = get_token_label(idx, tokenizer)
+        t = ax.text(x, y, label_txt, fontsize=6, color='black', alpha=0.8)
+        texts.append(t)
+    
+    return texts
+
+
+def visualize_all_modes_biplot(analyzer, step_data, scenario, tokenizer, out_dir):
+    """
+    全固有モードをペアリングしてBiplotを作成し、1枚の画像にまとめる
+    
+    ロジック:
+    - 固有値を大きい順に走査
+    - 複素共役ペア (Im > eps) -> [Re(α), Im(α)] としてプロット (1つのサブプロットで2次元分消費)
+    - 実数 (Im approx 0) -> 次の実数とペアにして [Re(α_i), Re(α_j)] (2次元分消費)
+    """
+    z_dim = analyzer.z_dim
+    # 軌跡データ取得
+    traj_alpha_with = np.array([d['alpha_with'] for d in step_data]).reshape(len(step_data), z_dim)
+    traj_alpha_without = np.array([d['alpha_without'] for d in step_data]).reshape(len(step_data), z_dim)
+    
+    # ペアリングロジック
+    pairs = [] # List of (idx_x, idx_y, type='complex'|'real', lambda_info)
+    used_indices = set()
+    
+    for i in range(z_dim):
+        if i in used_indices:
+            continue
+        
+        eig = analyzer.eigvals[i]
+        
+        # 複素数の場合 (虚部が一定以上)
+        if abs(eig.imag) > 1e-5:
+            # Re vs Im
+            pairs.append({
+                'x_idx': i, 'y_idx': i, # 同じインデックスだが Re vs Im
+                'type': 'complex',
+                'eig': eig
+            })
+            used_indices.add(i)
+            # 共役ペアと思われる次のインデックスも使用済みにする（厳密には確認すべきだが簡略化）
+            # 通常、scipy.linalg.eigは共役を近くに出すことが多いが、絶対値ソートしているので隣り合うはず
+            if i + 1 < z_dim and abs(analyzer.eigvals[i+1].imag) > 1e-5:
+                used_indices.add(i+1)
+        else:
+            # 実数の場合、次の実数ペアを探す
+            pair_found = False
+            for j in range(i + 1, z_dim):
+                if j not in used_indices and abs(analyzer.eigvals[j].imag) < 1e-5:
+                    pairs.append({
+                        'x_idx': i, 'y_idx': j,
+                        'type': 'real',
+                        'eig_x': eig, 'eig_y': analyzer.eigvals[j]
+                    })
+                    used_indices.add(i)
+                    used_indices.add(j)
+                    pair_found = True
+                    break
+            
+            if not pair_found:
+                # 相手がいない場合 (奇数個の実数モード)、単独でRe vs Stepにするか、とりあえず Re vs 0 にする
+                # ここではスキップまたは Re vs Im(0) として表示
+                pairs.append({
+                    'x_idx': i, 'y_idx': i, # Re vs Im (Imは0だが)
+                    'type': 'real_single',
+                    'eig': eig
+                })
+                used_indices.add(i)
+
+    # プロット作成
+    num_plots = len(pairs)
+    cols = 4
+    rows = (num_plots + cols - 1) // cols
+    
+    fig, axes = plt.subplots(rows, cols, figsize=(20, 5 * rows))
+    if rows == 1 and cols == 1: axes = [axes]
+    axes = np.array(axes).flatten()
+    
+    # トークンインデックス全取得
+    all_tokens = list(range(40)) # 0..39 (End=39)
+    
+    for plot_idx, pair_info in enumerate(pairs):
+        ax = axes[plot_idx]
+        
+        # X, Yデータの抽出
+        if pair_info['type'] == 'complex':
+            idx = pair_info['x_idx']
+            x_vals_with = traj_alpha_with[:, idx].real
+            y_vals_with = traj_alpha_with[:, idx].imag
+            x_vals_wo = traj_alpha_without[:, idx].real
+            y_vals_wo = traj_alpha_without[:, idx].imag
+            
+            # W (トークン) も複素平面に射影 (W_modal[k, idx] の Re vs Im)
+            W_vecs = np.column_stack([
+                analyzer.W_modal[:, idx].real,
+                analyzer.W_modal[:, idx].imag
+            ])
+            
+            title = f"Mode {idx} (Complex)\nλ={pair_info['eig'].real:.2f}±{abs(pair_info['eig'].imag):.2f}j"
+            xlabel, ylabel = "Real", "Imag"
+            
+        else: # real or real_single
+            idx_x = pair_info['x_idx']
+            idx_y = pair_info['y_idx']
+            
+            x_vals_with = traj_alpha_with[:, idx_x].real
+            y_vals_with = traj_alpha_with[:, idx_y].real if pair_info['type'] == 'real' else np.zeros_like(x_vals_with)
+            
+            x_vals_wo = traj_alpha_without[:, idx_x].real
+            y_vals_wo = traj_alpha_without[:, idx_y].real if pair_info['type'] == 'real' else np.zeros_like(x_vals_wo)
+            
+            # W
+            W_vecs = np.column_stack([
+                analyzer.W_modal[:, idx_x].real,
+                analyzer.W_modal[:, idx_y].real if pair_info['type'] == 'real' else np.zeros_like(analyzer.W_modal[:, idx_x].real)
+            ])
+            
+            if pair_info['type'] == 'real':
+                title = f"Mode {idx_x} vs {idx_y} (Real)\nλx={pair_info['eig_x'].real:.2f}, λy={pair_info['eig_y'].real:.2f}"
+                xlabel, ylabel = f"Re(α_{idx_x})", f"Re(α_{idx_y})"
+            else:
+                title = f"Mode {idx_x} (Single Real)\nλ={pair_info['eig'].real:.2f}"
+                xlabel, ylabel = f"Re(α_{idx_x})", "0"
+
+        # スケーリング計算
+        traj_max = max(np.max(np.abs(x_vals_with)), np.max(np.abs(y_vals_with)))
+        W_max = np.max(np.abs(W_vecs)) if W_vecs.size > 0 else 1.0
+        scale_factor = (traj_max / W_max) * 0.8 if W_max > 0 else 1.0
+        
+        # プロット: 軌跡
+        ax.plot(x_vals_with, y_vals_with, 'o-', color='steelblue', label='With', markersize=3, alpha=0.7)
+        ax.plot(x_vals_with[0], y_vals_with[0], 'D', color='green', markersize=5) # Start
+        ax.plot(x_vals_wo, y_vals_wo, '--', color='gray', alpha=0.4, label='W/o')
+        
+        # プロット: トークン (全表示 + 自動スケーリング)
+        plot_tokens_on_ax(ax, W_vecs, all_tokens, tokenizer, scale_factor)
+        
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel(xlabel, fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.axhline(0, color='k', ls=':', lw=0.5)
+        ax.axvline(0, color='k', ls=':', lw=0.5)
+        ax.grid(True, alpha=0.3)
+        if plot_idx == 0: ax.legend(fontsize=6)
+
+    # 余ったサブプロットを消す
+    for k in range(num_plots, len(axes)):
+        axes[k].axis('off')
+        
+    plt.tight_layout()
+    save_path = os.path.join(out_dir, f"{scenario['name']}_eigen_biplot_all.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved Eigen Biplot: {save_path}")
+
+
+def visualize_pca_biplot(step_data, scenario, tokenizer, model, out_dir):
+    """
+    PCAによるBiplot (2D & 3D) - サンプル数不足対応版
+    zの軌跡と、Wの射影を表示
+    """
+    # データが空の場合はスキップ
+    if not step_data:
+        print(f"Skipping PCA: No step data for {scenario['name']}")
+        return
+
+    # zデータの収集
+    z_with_list = [d['z_with'] for d in step_data]
+    z_without_list = [d['z_without'] for d in step_data]
+    
+    # shape: [T, z_dim]
+    Z_with = np.array(z_with_list)
+    Z_without = np.array(z_without_list)
+    
+    # 結合してfit
+    Z_all = np.concatenate([Z_with, Z_without], axis=0)
+    
+    # サンプル数チェック
+    n_samples, n_features = Z_all.shape
+    
+    # PCAのコンポーネント数は、サンプル数と特徴量数の最小値を超えられない
+    # 3次元プロットを目指すが、データ不足なら2次元以下に落とす
+    n_components = min(3, n_samples, n_features)
+    
+    if n_components < 2:
+        print(f"Skipping PCA for {scenario['name']}: Not enough samples (n={n_samples}) for 2D plot.")
+        return
+
+    # PCA実行
+    pca = PCA(n_components=n_components)
+    pca.fit(Z_all)
+    
+    # Transform Z
+    Z_with_pca = pca.transform(Z_with)
+    Z_without_pca = pca.transform(Z_without)
+    
+    # Transform W (トークン重み)
+    # W_pca = W @ V_pca.T
+    # components_ は (n_components, n_features) なので転置して掛ける
+    W_weight = model.to_logits.weight.detach().cpu().numpy() # [vocab, z_dim]
+    W_pca = W_weight @ pca.components_.T # [vocab, n_components]
+    
+    # 全トークンインデックス
+    all_tokens = list(range(40))
+    
+    # スケーリング計算 (2次元ベース)
+    traj_max = np.max(np.abs(Z_with_pca[:, :2]))
+    W_max = np.max(np.abs(W_pca[:, :2]))
+    scale_factor = (traj_max / W_max) * 0.8 if W_max > 0 else 1.0
+    
+    # --- 2D Plot (PC1 vs PC2) ---
+    # n_components >= 2 なので必ず実行可能
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    # 軌跡
+    ax.plot(Z_with_pca[:, 0], Z_with_pca[:, 1], 'o-', color='purple', label='With Plaza', markersize=4, alpha=0.8)
+    ax.plot(Z_with_pca[0, 0], Z_with_pca[0, 1], 'D', color='green', markersize=6, label='Start')
+    ax.plot(Z_without_pca[:, 0], Z_without_pca[:, 1], '--', color='gray', label='W/o Plaza', alpha=0.5)
+    
+    # トークン
+    plot_tokens_on_ax(ax, W_pca[:, :2], all_tokens, tokenizer, scale_factor, color='red', alpha=0.5)
+    
+    ax.set_xlabel(f"PC1 ({pca.explained_variance_ratio_[0]:.2%})")
+    ax.set_ylabel(f"PC2 ({pca.explained_variance_ratio_[1]:.2%})")
+    ax.set_title(f"PCA Biplot (2D): {scenario['name']}")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    
+    save_path_2d = os.path.join(out_dir, f"{scenario['name']}_pca_biplot_2d.png")
+    plt.savefig(save_path_2d, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved PCA 2D: {save_path_2d}")
+    
+    # --- 3D Plot ---
+    # n_components >= 3 の場合のみ実行
+    if n_components >= 3:
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        
+        # 軌跡
+        ax.plot(Z_with_pca[:, 0], Z_with_pca[:, 1], Z_with_pca[:, 2], 'o-', color='purple', label='With', markersize=3)
+        ax.plot(Z_without_pca[:, 0], Z_without_pca[:, 1], Z_without_pca[:, 2], '--', color='gray', label='W/o', alpha=0.5)
+        
+        # トークン (3D) - ドットのみ
+        W_pca_scaled = W_pca * scale_factor
+        ax.scatter(W_pca_scaled[:, 0], W_pca_scaled[:, 1], W_pca_scaled[:, 2], color='red', s=5, alpha=0.5)
+        
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+        ax.set_title(f"PCA Biplot (3D): {scenario['name']}")
+        
+        save_path_3d = os.path.join(out_dir, f"{scenario['name']}_pca_biplot_3d.png")
+        plt.savefig(save_path_3d, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"Saved PCA 3D: {save_path_3d}")
+    else:
+        print(f"Skipping PCA 3D for {scenario['name']}: Not enough dimensions (n_components={n_components})")
+
+# =========================================================
 #  Scenario Analysis
 # =========================================================
 
 def encode_prefix_with_plaza(model, tokenizer, prefix, agent_id, holiday, time_zone, 
                               plaza_tokens, use_plaza, device):
-    """Prefixをエンコードして初期潜在状態z_0を取得"""
     seq_len = len(prefix)
     tokens = torch.tensor([prefix], dtype=torch.long).to(device)
     stay_counts = tokenizer.calculate_stay_counts(tokens).to(device)
@@ -214,7 +471,6 @@ def encode_prefix_with_plaza(model, tokenizer, prefix, agent_id, holiday, time_z
 
 def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix,
                                   scenario, num_steps, device, out_dir):
-    """Greedyロールアウトしながら解析"""
     print(f"\n{'='*60}")
     print(f"Analyzing Scenario: {scenario['name']}")
     print(f"{'='*60}")
@@ -235,16 +491,15 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
     step_data = []
     current_node = prefix[-1] % 19
     generated_with = []
-    generated_without = []
     
     A_np = analyzer.model.A.detach().cpu().numpy().T
     
     for step in range(num_steps):
-        print(f"\n--- Step {step+1}/{num_steps} ---")
-        
+        # z_t+1 = A @ z_t
         z_next_with = A_np @ z_with
         z_next_without = A_np @ z_without
         
+        # 固有空間射影
         alpha_with = analyzer.transform_to_eigenspace(z_next_with)
         alpha_without = analyzer.transform_to_eigenspace(z_next_without)
         
@@ -264,10 +519,6 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
         next_token_without = movable_tokens[np.argmax(movable_probs_without)]
         
         generated_with.append(next_token_with)
-        generated_without.append(next_token_without)
-        
-        print(f"  Current node: {current_node}")
-        print(f"  Selected (with): {get_token_label(next_token_with, tokenizer)} (p={movable_probs_with.max():.4f})")
         
         step_data.append({
             'step': step,
@@ -280,7 +531,6 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
             'movable_probs_without': movable_probs_without.copy(),
             'movable_probs_diff': movable_probs_diff.copy(),
             'next_token_with': next_token_with,
-            'next_token_without': next_token_without,
         })
         
         z_with = z_next_with
@@ -291,175 +541,17 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
         elif 19 <= next_token_with <= 37:
             current_node = next_token_with - 19
         else:
-            print(f"  End token selected, stopping.")
             break
+            
+    # --- Visualization Calls ---
     
-    # 既存のロールアウト可視化
-    visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir)
-
-    # ★追加: Koopman Biplot (z軌跡とWベクトルの同時プロット)
-    visualize_koopman_biplot(analyzer, step_data, scenario, tokenizer, out_dir)
+    # 1. 固有空間 Biplot (全モード網羅)
+    visualize_all_modes_biplot(analyzer, step_data, scenario, tokenizer, out_dir)
+    
+    # 2. PCA Biplot (2D & 3D)
+    visualize_pca_biplot(step_data, scenario, tokenizer, model, out_dir)
     
     print(f"\nGenerated sequence (with plaza): {prefix} -> {generated_with}")
-
-
-def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir):
-    """ロールアウト解析結果を可視化（5ステップ横並び）"""
-    num_steps = len(step_data)
-    z_dim = analyzer.z_dim
-    
-    fig = plt.figure(figsize=(num_steps * 6, 28))
-    gs = gridspec.GridSpec(6, num_steps, figure=fig, hspace=0.35, wspace=0.25,
-                          top=0.96, bottom=0.04, left=0.05, right=0.98)
-    fig.suptitle(f"Koopman Mode Decomposition Analysis: {scenario['name']}", fontsize=24, weight='bold')
-    
-    # スケール計算用の収集
-    all_alpha_vals = []
-    all_W_vals = []
-    all_prob_vals = []
-    all_diff_vals = []
-    for data in step_data:
-        all_alpha_vals.extend([data['alpha_with'], data['alpha_without']])
-        movable = data['movable_tokens']
-        all_W_vals.append(analyzer.W_modal[movable, :])
-        all_prob_vals.extend([data['movable_probs_with'], data['movable_probs_without']])
-        all_diff_vals.append(data['movable_probs_diff'])
-    
-    alpha_vmax = max(np.abs(np.concatenate(all_alpha_vals)).max(), 1e-6)
-    W_vmax = max(np.abs(np.concatenate(all_W_vals, axis=0)).max(), 1e-6)
-    prob_vmax = max(np.concatenate(all_prob_vals).max(), 1e-6)
-    diff_vmax = max(np.abs(np.concatenate(all_diff_vals)).max(), 1e-6)
-    
-    eigenmode_labels = [f"{lam.real:.2f}{lam.imag:+.2f}j" for lam in analyzer.eigvals]
-    
-    for step_idx, data in enumerate(step_data):
-        col = step_idx
-        movable = data['movable_tokens']
-        token_labels = [get_token_label(t, tokenizer) for t in movable]
-        num_movable = len(movable)
-        
-        # alpha準備
-        alpha_with_plot = np.real(np.asarray(data['alpha_with'])).reshape(1, -1)
-        alpha_without_plot = np.real(np.asarray(data['alpha_without'])).reshape(1, -1)
-        delta_alpha = np.real(np.asarray(data['alpha_with']) - np.asarray(data['alpha_without']))
-        
-        # Row 0: alpha (with)
-        ax1 = fig.add_subplot(gs[0, col])
-        im1 = ax1.imshow(alpha_with_plot, cmap='coolwarm', aspect='auto', vmin=-alpha_vmax, vmax=alpha_vmax)
-        ax1.set_title(f"Step {step_idx+1}\n① α (with)", fontsize=11)
-        ax1.set_xticks([]); ax1.set_yticks([])
-        
-        # Row 1: alpha (w/o)
-        ax2 = fig.add_subplot(gs[1, col])
-        im2 = ax2.imshow(alpha_without_plot, cmap='coolwarm', aspect='auto', vmin=-alpha_vmax, vmax=alpha_vmax)
-        ax2.set_title("② α (w/o)", fontsize=11)
-        ax2.set_xticks(range(z_dim)); ax2.set_xticklabels(eigenmode_labels, rotation=90, fontsize=7)
-        ax2.set_yticks([])
-
-        # Row 2: W contrib (with)
-        ax3 = fig.add_subplot(gs[2, col])
-        W_contrib = np.real(analyzer.W_modal[movable, :] * data['alpha_with'].reshape(1, -1))
-        im3 = ax3.imshow(W_contrib.T, cmap='coolwarm', aspect='auto')
-        ax3.set_title("③ Mode×Token (with)", fontsize=11)
-        ax3.set_xticks(range(num_movable)); ax3.set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
-        ax3.set_yticks(range(z_dim)); ax3.set_yticklabels(eigenmode_labels, fontsize=6)
-
-        # Row 3: W diff
-        ax4 = fig.add_subplot(gs[3, col])
-        W_diff = np.real(analyzer.W_modal[movable, :] * delta_alpha.reshape(1, -1))
-        im4 = ax4.imshow(W_diff.T, cmap='coolwarm', aspect='auto')
-        ax4.set_title("④ ΔContrib (with-w/o)", fontsize=11)
-        ax4.set_xticks(range(num_movable)); ax4.set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
-        ax4.set_yticks([])
-
-        # Row 4: Prob
-        ax5 = fig.add_subplot(gs[4, col])
-        x = np.arange(num_movable)
-        ax5.bar(x - 0.15, data['movable_probs_with'], 0.3, label='With', color='steelblue')
-        ax5.bar(x + 0.15, data['movable_probs_without'], 0.3, label='W/o', color='coral')
-        ax5.set_xticks(x); ax5.set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
-        ax5.set_title("⑤ Probabilities", fontsize=11); ax5.set_ylim(0, prob_vmax * 1.1)
-        if col == 0: ax5.legend()
-
-        # Row 5: Diff
-        ax6 = fig.add_subplot(gs[5, col])
-        colors = ['green' if v >= 0 else 'red' for v in data['movable_probs_diff']]
-        ax6.bar(x, data['movable_probs_diff'], color=colors)
-        ax6.set_xticks(x); ax6.set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
-        ax6.set_title("⑥ Prob Diff", fontsize=11); ax6.axhline(0, color='k', linewidth=0.5)
-
-    save_path = os.path.join(out_dir, f"{scenario['name']}_rollout_analysis.png")
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {save_path}")
-
-
-def visualize_koopman_biplot(analyzer, step_data, scenario, tokenizer, out_dir):
-    """
-    Koopman Biplot: 固有空間上での z の軌跡と、W（トークン重み）の可視化
-    X軸: 第1固有モード (Real), Y軸: 第2固有モード (Real)
-    """
-    z_dim = analyzer.z_dim
-    traj_alpha_with = np.array([d['alpha_with'] for d in step_data]).reshape(len(step_data), z_dim)
-    traj_alpha_without = np.array([d['alpha_without'] for d in step_data]).reshape(len(step_data), z_dim)
-    
-    idx_x, idx_y = 0, 1
-    eig_x = analyzer.eigvals[idx_x]
-    eig_y = analyzer.eigvals[idx_y]
-    
-    fig, ax = plt.subplots(figsize=(10, 10))
-    
-    # 1. zの軌跡 (With Plaza)
-    x_vals = traj_alpha_with[:, idx_x].real
-    y_vals = traj_alpha_with[:, idx_y].real
-    ax.plot(x_vals, y_vals, 'o-', color='steelblue', label='Trajectory (With)', markersize=4, alpha=0.7)
-    ax.plot(x_vals[0], y_vals[0], 'D', color='green', markersize=8, label='Start')
-    ax.plot(x_vals[-1], y_vals[-1], 'X', color='red', markersize=8, label='End')
-    
-    # 2. zの軌跡 (Without Plaza)
-    x_vals_wo = traj_alpha_without[:, idx_x].real
-    y_vals_wo = traj_alpha_without[:, idx_y].real
-    ax.plot(x_vals_wo, y_vals_wo, '--', color='gray', alpha=0.4, label='Trajectory (W/o)')
-
-    # 3. W (トークン重みベクトル)
-    generated_tokens = set([d['next_token_with'] for d in step_data])
-    initial_movables = set(step_data[0]['movable_tokens'])
-    target_tokens = generated_tokens.union(initial_movables)
-    
-    W_modal = analyzer.W_modal
-    traj_max = np.max(np.abs(np.concatenate([x_vals, y_vals])))
-    W_max = np.max(np.abs(W_modal[list(target_tokens)][:, [idx_x, idx_y]]))
-    scale_factor = (traj_max / W_max) * 0.8
-    
-    texts = []
-    for token in target_tokens:
-        vec_x = W_modal[token, idx_x].real
-        vec_y = W_modal[token, idx_y].real
-        ax.arrow(0, 0, vec_x * scale_factor, vec_y * scale_factor, 
-                 color='coral', alpha=0.5, head_width=traj_max*0.03, length_includes_head=True)
-        label_txt = get_token_label(token, tokenizer)
-        t = ax.text(vec_x * scale_factor * 1.1, vec_y * scale_factor * 1.1, label_txt, 
-                    color='darkred', fontsize=9, fontweight='bold')
-        texts.append(t)
-
-    ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
-    ax.axvline(0, color='black', linewidth=0.5, linestyle='--')
-    ax.set_xlabel(f"Mode {idx_x} (λ={eig_x.real:.2f}{eig_x.imag:+.2f}j)", fontsize=12)
-    ax.set_ylabel(f"Mode {idx_y} (λ={eig_y.real:.2f}{eig_y.imag:+.2f}j)", fontsize=12)
-    ax.set_title(f"Koopman Biplot: Trajectory & Token Weights\nScenario: {scenario['name']}", fontsize=14)
-    ax.legend(loc='upper right', fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
-    try:
-        from adjustText import adjust_text
-        adjust_text(texts, arrowprops=dict(arrowstyle='-', color='gray', alpha=0.5))
-    except ImportError:
-        pass
-    
-    save_path = os.path.join(out_dir, f"{scenario['name']}_biplot.png")
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved biplot: {save_path}")
 
 
 # =========================================================
@@ -468,7 +560,7 @@ def visualize_koopman_biplot(analyzer, step_data, scenario, tokenizer, out_dir):
 
 def main():
     print("="*60)
-    print("Koopman Analysis Pipeline (Original Model)")
+    print("Koopman Analysis Pipeline (Original Model) - Advanced Viz")
     print("="*60)
     
     # データロード
@@ -491,7 +583,12 @@ def main():
     state_dict = ckpt['model_state_dict']
     c = ckpt.get('config', {})
     
-    # モデル初期化
+    # エージェント数等の自動取得 (Configにない場合)
+    if 'agent_embedding.weight' in state_dict:
+        num_agents = state_dict['agent_embedding.weight'].shape[0]
+    else:
+        num_agents = c.get('num_agents', 1)
+
     model = KoopmanRoutesFormer(
         vocab_size=c.get('vocab_size', 42),
         token_emb_dim=c.get('token_emb_dim', 64),
@@ -502,7 +599,7 @@ def main():
         z_dim=c.get('z_dim', 16),
         pad_token_id=38,
         base_N=base_N,
-        num_agents=c.get('num_agents', 1),
+        num_agents=num_agents,
         agent_emb_dim=c.get('agent_emb_dim', 16),
         max_stay_count=c.get('max_stay_count', 500),
         stay_emb_dim=c.get('stay_emb_dim', 16),

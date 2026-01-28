@@ -1,0 +1,101 @@
+Log saved to: /home/mizutani/projects/RF/0128RL/prism_rl_evaluation/terminal_log.txt
+============================================================
+
+=== Loading Data ===
+Train sequences: 7199
+Val sequences: 1542
+Test sequences: 1544
+
+Evaluating on: TEST (1544 sequences)
+
+=== Computing Node Distances ===
+
+=== Loading Prism-RL Model ===
+Parameters: {}
+Computing shortest path distances...
+  Done.
+Prism-RL Generator initialized:
+  Nodes: 17
+  Links: 85
+  Parameters: {}
+  Detour rate τ: 3.0
+  Min choice stage J: 3
+
+=== Starting Evaluation ===
+Prefix lengths: [5]
+Short/Long threshold: 8
+
+--- Evaluating with Prefix Length = 5 ---
+
+Saved metrics to: /home/mizutani/projects/RF/0128RL/prism_rl_evaluation/metrics_prism_rl_prefix5.csv
+
+============================================================
+Evaluation Results
+============================================================
+
+============================================================
+Prefix Length = 5
+============================================================
+
+>>> Overall (N=1182)
+  [Gen] ED (norm):       0.8900
+  [Gen] Geo-ED (norm):   0.8087
+  [Gen] Geo-ED2 (norm):  0.5384  (Relaxed: 0 if <=2hop)
+  [Gen] DTW (norm):      0.8580
+  [Gen] Geo-DTW (norm):  0.6109
+  [Gen] Geo-DTW2 (norm): 0.1730  (Relaxed: 0 if <=2hop)
+  [Stay Metrics] (Detected Stays Only)
+    Detection Rate:      1.1622
+    Length Diff (avg):   0.3731
+    Length Diff (Abs):   0.7965
+    Loc Dist (hops):     0.0000
+    Integrated Cost:     0.6344
+  [DwellU Metrics] (NEW)
+    DwellU (stays only): 0.0396
+    DwellU (all steps):  0.2777
+    Node Accuracy:       0.1832
+
+>>> Short Term (<= 8 steps) (N=1049)
+  [Gen] ED (norm):       0.8944
+  [Gen] Geo-ED (norm):   0.8030
+  [Gen] Geo-ED2 (norm):  0.5309  (Relaxed: 0 if <=2hop)
+  [Gen] DTW (norm):      0.8663
+  [Gen] Geo-DTW (norm):  0.6038
+  [Gen] Geo-DTW2 (norm): 0.1762  (Relaxed: 0 if <=2hop)
+  [Stay Metrics] (Detected Stays Only)
+    Detection Rate:      1.0706
+    Length Diff (avg):   0.5118
+    Length Diff (Abs):   0.7588
+    Loc Dist (hops):     0.0000
+    Integrated Cost:     0.6882
+  [DwellU Metrics] (NEW)
+    DwellU (stays only): 0.0371
+    DwellU (all steps):  0.2890
+    Node Accuracy:       0.1963
+
+>>> Long Term (> 8 steps) (N=133)
+  [Gen] ED (norm):       0.8547
+  [Gen] Geo-ED (norm):   0.8534
+  [Gen] Geo-ED2 (norm):  0.5974  (Relaxed: 0 if <=2hop)
+  [Gen] DTW (norm):      0.7924
+  [Gen] Geo-DTW (norm):  0.6669
+  [Gen] Geo-DTW2 (norm): 0.1475  (Relaxed: 0 if <=2hop)
+  [Stay Metrics] (Detected Stays Only)
+    Detection Rate:      1.4615
+    Length Diff (avg):   -0.0801
+    Length Diff (Abs):   0.9199
+    Loc Dist (hops):     0.0000
+    Integrated Cost:     0.4583
+  [DwellU Metrics] (NEW)
+    DwellU (stays only): 0.0592
+    DwellU (all steps):  0.1886
+    Node Accuracy:       0.0798
+
+=== Generating Plots ===
+Generating PDF for prefix=5 (first 1000 samples)...
+Saved to: /home/mizutani/projects/RF/0128RL/prism_rl_evaluation/trajectories_prism_rl_prefix5.pdf
+
+============================================================
+Evaluation Complete!
+Results saved to: /home/mizutani/projects/RF/0128RL/prism_rl_evaluation
+============================================================

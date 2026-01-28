@@ -8,6 +8,7 @@ KoopmanとAblationモデルの性能比較
 - 短期/長期の閾値可変
 - 全評価指標
 - ★追加: ターミナル出力をファイルにも自動保存
+- ★★NEW: DwellU指標（圧縮版+実時間版）を追加
 """
 
 import torch
@@ -28,6 +29,9 @@ from DKP_RF import KoopmanRoutesFormer
 from Transformer_Ablation import TransformerAblation
 from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
+
+# ★NEW: DwellU関数をインポート
+from utils_prism import summarize_dwell_metrics
 
 
 # =========================================================
@@ -51,7 +55,7 @@ CONFIG = {
     # モデルパス
     "model_koopman_path": "/home/mizutani/projects/RF/runs/20260127_014201/model_weights_20260127_014201.pth",
     "model_ablation_path": "/home/mizutani/projects/RF/runs/20260127_014847/ablation_weights_20260127_014847.pth",
-    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation_results3",
+    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation",
 
 
     "plot_max_samples": 1000,
@@ -60,7 +64,7 @@ CONFIG = {
     "prefix_lengths": [5],  # 複数のPrefix長で評価
     
     # ★★★ 短期/長期の閾値 ★★★
-    "short_long_threshold": 8,  # これ以下が短期、より大きいが長期
+    "short_long_threshold": 5,  # これ以下が短期、より大きいが長期
     
     # Context Logic
     "holidays": [20240928, 20240929, 20251122, 20251123],
@@ -756,6 +760,10 @@ def main():
             k_rate, k_ldiff, k_labs, k_loc, k_cost = summarize_stay(stay_metrics_k)
             a_rate, a_ldiff, a_labs, a_loc, a_cost = summarize_stay(stay_metrics_a)
             
+            # ★NEW: DwellU指標（圧縮版+実時間版）
+            dwell_metrics_k = summarize_dwell_metrics(pred_k, gt_future, base_N=base_N)
+            dwell_metrics_a = summarize_dwell_metrics(pred_a, gt_future, base_N=base_N)
+            
             # メトリクス保存
             metrics_list.append({
                 'id': idx,
@@ -800,6 +808,19 @@ def main():
                 'a_stay_len_abs': a_labs if a_labs is not None else np.nan,
                 'a_stay_dist': a_loc if a_loc is not None else np.nan,
                 'a_stay_cost': a_cost if a_cost is not None else np.nan,
+                
+                # ★NEW: DwellU指標
+                'k_dwell_u': dwell_metrics_k['dwell_u'],
+                'k_dwell_u_all': dwell_metrics_k['dwell_u_all'],
+                'k_dwell_u_realtime': dwell_metrics_k['dwell_u_realtime'],
+                'k_dwell_u_all_realtime': dwell_metrics_k['dwell_u_all_realtime'],
+                'k_node_accuracy': dwell_metrics_k['node_accuracy'],
+                
+                'a_dwell_u': dwell_metrics_a['dwell_u'],
+                'a_dwell_u_all': dwell_metrics_a['dwell_u_all'],
+                'a_dwell_u_realtime': dwell_metrics_a['dwell_u_realtime'],
+                'a_dwell_u_all_realtime': dwell_metrics_a['dwell_u_all_realtime'],
+                'a_node_accuracy': dwell_metrics_a['node_accuracy'],
                 
                 # 系列保存
                 'prompt': prompt_seq,
@@ -867,6 +888,14 @@ def main():
         print(f"    Length Diff (Abs):   Koopman={d['k_stay_len_abs'].mean():.4f} | Ablation={d['a_stay_len_abs'].mean():.4f}")
         print(f"    Loc Dist (hops):     Koopman={d['k_stay_dist'].mean():.4f} | Ablation={d['a_stay_dist'].mean():.4f}")
         print(f"    Integrated Cost:     Koopman={d['k_stay_cost'].mean():.4f} | Ablation={d['a_stay_cost'].mean():.4f}")
+        
+        # ★NEW: DwellU指標
+        print("  [DwellU Metrics] (NEW)")
+        print(f"    DwellU (stays only):         Koopman={d['k_dwell_u'].mean():.4f} | Ablation={d['a_dwell_u'].mean():.4f}")
+        print(f"    DwellU (all steps):          Koopman={d['k_dwell_u_all'].mean():.4f} | Ablation={d['a_dwell_u_all'].mean():.4f}")
+        print(f"    DwellU RealTime (stays):     Koopman={d['k_dwell_u_realtime'].mean():.4f} | Ablation={d['a_dwell_u_realtime'].mean():.4f}")
+        print(f"    DwellU RealTime (all):       Koopman={d['k_dwell_u_all_realtime'].mean():.4f} | Ablation={d['a_dwell_u_all_realtime'].mean():.4f}")
+        print(f"    Node Accuracy:               Koopman={d['k_node_accuracy'].mean():.4f} | Ablation={d['a_node_accuracy'].mean():.4f}")
     
     # 各Prefix長ごとに表示
     for result in all_results:
