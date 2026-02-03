@@ -97,11 +97,41 @@ class KoopmanRoutesFormer(nn.Module):
         self.pad_token_id = pad_token_id
         self.vocab_size = vocab_size
         self.z_dim = z_dim
+        # self.u_dim = z_dim
         self.max_stay_count = max_stay_count
         self.use_aux_loss = use_aux_loss
 
+        # u(t)側（制御入力）用：新規に追加（別パラメータ）
+        self.holiday_embedding_u = nn.Embedding(2, holiday_emb_dim)
+        self.time_zone_embedding_u = nn.Embedding(2, time_zone_emb_dim)
+        self.event_embedding_u = nn.Embedding(2, event_emb_dim)
+
         # Koopman Dynamics (B行列は削除)
         self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
+
+        # # 追加：制御入力 u(t) 用のノード埋め込み（Transformerの token_embedding と分離）
+        # self.control_embedding = nn.Embedding(self.base_N*2, self.u_dim)
+
+        # # 追加：B行列
+        # self.B = nn.Parameter(torch.randn(self.z_dim, self.u_dim) * 0.005)
+
+        # ---- ここから差し替え ----
+        # token由来の制御埋め込み次元（いままでと同じ z_dim にしておくのが最小変更）
+        self.u_tok_dim = z_dim
+
+        # u(t) 全体は「token_u + (holiday/timezone/event)」を結合した次元
+        self.u_dim = self.u_tok_dim + holiday_emb_dim + time_zone_emb_dim + event_emb_dim
+
+        # 制御入力 u(t) 用：トークン種別（move/stayノード）埋め込み
+        self.control_token_embedding = nn.Embedding(self.base_N * 2, self.u_tok_dim)
+
+        # B行列（z_dim × u_dim に拡張）
+        self.B = nn.Parameter(torch.randn(self.z_dim, self.u_dim) * 0.005)
+        # ---- ここまで差し替え ----
+
+        # スケジュールサンプリング
+        self.p_tf = 1.0
+
 
         # 補助損失用のヘッド
         if use_aux_loss:
@@ -277,21 +307,117 @@ class KoopmanRoutesFormer(nn.Module):
         z = z_0
         logits_list = []
         z_list = [z_0]  # ★追加：z_0 から保持
-        
-        for k in range(K):
-            # A行列のみで発展（B項なし）
-            z = z @ self.A.T  # [B, z_dim]
-            z_list.append(z)  # ★追加
+        u_list = []
+        Bu_list = []
 
-            # ロジット出力
-            logits = self.to_logits(z)  # [B, vocab]
+        # 初期の「現在トークン」＝ prefix の最後の有効トークン
+        batch_size = prefix_tokens.size(0)
+        if prefix_mask is None:
+            pad_mask = (prefix_tokens == self.pad_token_id)
+        else:
+            pad_mask = prefix_mask
+        valid_lengths = (~pad_mask).sum(dim=1)            # [B]
+        last_indices = (valid_lengths - 1).clamp(min=0)   # [B]
+        cur_tok = prefix_tokens[torch.arange(batch_size), last_indices]  # [B]
+
+        # 念のため：padが紛れたら0に落とす（学習データが正しければ基本起きない）
+        cur_tok = cur_tok.clamp(min=0, max=self.base_N * 2 - 1)
+
+        # prefix最後の条件を固定して使う（future_* は参照しない）
+        fixed_h = prefix_holidays[torch.arange(batch_size), last_indices]     # [B]
+        fixed_tz = prefix_time_zones[torch.arange(batch_size), last_indices]  # [B]
+        fixed_e = prefix_events[torch.arange(batch_size), last_indices]       # [B]
+
+        # ---------------------------
+        # prefix時刻（系列代表時刻）で条件を一回だけ判定
+        # ---------------------------
+        if prefix_times is None:
+            raise ValueError("prefix_times is required for context determination")
+
+        # prefix_times: [B]  (例: 202409290900 のような int)
+        t_int = prefix_times.long()
+
+        date_int = t_int // 10000
+        hour = (t_int // 100) % 100
+
+        # 休日判定（configと同じ）
+        HOLIDAYS = {20240928, 20240929, 20251122, 20251123}
+        fixed_h = torch.isin(date_int, torch.tensor(list(HOLIDAYS), device=t_int.device)).long()
+
+        # 夜判定（19:00-02:00）
+        night_start = 19
+        night_end = 2
+        fixed_tz = ((hour >= night_start) | (hour < night_end)).long()
+
+        # イベント対象ノード集合（prefix時刻で決定）
+        # events: (date, start_hour, end_hour, [nodes])
+        EVENTS = [
+            (20240929, 9, 16, [14]),
+            (20251122, 10, 19, [2, 11]),
+            (20251123, 10, 16, [2]),
+        ]
+
+        # event_node_mask[b, n] = 1 なら、その系列(b)のイベント対象ノード n
+        event_node_mask = torch.zeros((t_int.size(0), self.base_N), device=t_int.device, dtype=torch.bool)
+        for ev_date, ev_start, ev_end, ev_nodes in EVENTS:
+            cond = (date_int == ev_date) & (ev_start <= hour) & (hour < ev_end)
+            if cond.any():
+                node_idx = torch.tensor(ev_nodes, device=t_int.device, dtype=torch.long)
+                event_node_mask[cond] = event_node_mask[cond].clone()
+                event_node_mask[cond][:, node_idx] = True
+
+        for k in range(K):
+            # --- (1) そのステップの条件を決める（学習時は future_* を優先） ---
+            # cur_tok -> node_id（move/stay どちらでも同じ node_id）
+            # cur_tok は既に 0..2*base_N-1 に clamp 済みの想定 :contentReference[oaicite:5]{index=5}
+            node_id = cur_tok % self.base_N  # [B]
+
+            # event_flag: イベント対象ノードなら1、そうでなければ0
+            batch_idx = torch.arange(batch_size, device=cur_tok.device)
+            e_k = event_node_mask[batch_idx, node_id].long()  # [B]
+
+            h_k = fixed_h      # [B] すべてのトークンに同じ
+            tz_k = fixed_tz    # [B] すべてのトークンに同じ
+
+            # --- (2) u(t) を concat で構築 ---
+            u_tok = self.control_token_embedding(cur_tok)  # [B, u_tok_dim]
+            u_h  = self.holiday_embedding_u(h_k)
+            u_tz = self.time_zone_embedding_u(tz_k)
+            u_e  = self.event_embedding_u(e_k)
+              # [B, event_emb_dim]
+
+            u = torch.cat([u_tok, u_h, u_tz, u_e], dim=-1) # [B, u_dim]
+            u_list.append(u)
+
+            Bu = u @ self.B.T                               # [B, z_dim]
+            Bu_list.append(Bu)
+
+            z = z @ self.A.T + 0.1 * Bu
+            z_list.append(z)
+
+            logits = self.to_logits(z)
             logits_list.append(logits)
-        
+
+            # --- 次トークン（既存ロジックそのまま） ---
+            if self.training and (future_tokens is not None):
+                if torch.rand(1, device=logits.device).item() < float(self.p_tf):
+                    cur_tok = future_tokens[:, k]
+                else:
+                    cur_tok = torch.argmax(logits, dim=-1)
+            else:
+                cur_tok = torch.argmax(logits, dim=-1)
+
+            cur_tok = cur_tok.clamp(min=0, max=self.base_N * 2 - 1)
+
+
+
         pred_logits = torch.stack(logits_list, dim=1)  # [B, K, vocab]
         
         return {
             'pred_logits': pred_logits,
             'z_0': z_0,
+            "u_traj": torch.stack(u_list, dim=1),  # ★追加: [B, K, u_dim]
+            "Bu_traj": torch.stack(Bu_list, dim=1),  # ★追加: [B, K, z_dim]
             "z_traj": torch.stack(z_list, dim=1),  # ★追加: [B, K+1, z_dim]
             'aux_losses': aux_losses,
         }

@@ -1,3 +1,4 @@
+from seaborn.matrix import dendrogram
 import torch
 import torch.nn as nn
 import numpy as np
@@ -23,7 +24,7 @@ class Dummy: pass
 wandb = Dummy()
 wandb.config = type("C", (), {
     "learning_rate": 1e-4, 
-    "epochs": 100, 
+    "epochs": 150, 
     "batch_size": 32, 
     "d_ie": 64,
     "head_num": 4, 
@@ -54,7 +55,7 @@ wandb.config = type("C", (), {
     "aux_mode_weight": 0.01,   # モード分類損失の重み (0で無効化)
 
     # ★ Lyapunov正則化
-    "lyap_alpha": 0.001,  # Lyapunov正則化の重み
+    "lyap_alpha": 0.0,  # Lyapunov正則化の重み
     "lyap_eps": 1e-3,     # 許容（0でもOKだが少し入れると安定）
     
     # ★ 地理的距離損失
@@ -143,6 +144,31 @@ event_pt = torch.from_numpy(event_arr).long()
 vocab_size = network.N + 4
 print(f"Vocabulary size: {vocab_size}")
 print(f"Number of sequences: {len(trip_arr)}")
+
+# スケジュールサンプリング
+def scheduled_sampling_p_tf(epoch: int) -> float:
+    """
+    epochに応じて teacher forcing 確率 p_tf を返す。
+    まずは安全にゆっくり下げる（手戻りが少ない設定）。
+    """
+    # 例：0-9:1.0, 10-19:0.9, 20-29:0.7, 30+:0.5
+    if epoch < 10:
+        return 1.0
+    elif epoch < 20:
+        return 0.9
+    elif epoch < 30:
+        return 0.7
+    # else:
+    #     return 0.5
+    elif epoch < 40:
+        return 0.5
+    elif epoch < 50:
+        return 0.3
+    elif epoch < 70:
+        return 0.1
+    else:
+        return 0.05
+    
 
 # ========================================
 # 可変長Prefixデータセット
@@ -515,6 +541,8 @@ history = {
 for epoch in range(wandb.config.epochs):
     # --- Training ---
     model.train()
+    model.p_tf = scheduled_sampling_p_tf(epoch)
+    print(f"[ScheduledSampling] epoch={epoch+1} p_tf={model.p_tf:.3f}")
     epoch_metrics_train = {
         "loss": 0.0, "ce": 0.0, "geo": 0.0,
         "count": 0.0, "mode": 0.0, "lyap": 0.0
@@ -522,6 +550,8 @@ for epoch in range(wandb.config.epochs):
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{wandb.config.epochs} [Train]")
     
+    n_train_used = 0
+    n_val_used = 0
     for batch in pbar:
         # データ取得
         prefix_tokens = batch['prefix_tokens'].to(device)
@@ -533,6 +563,8 @@ for epoch in range(wandb.config.epochs):
         
         future_tokens = batch['future_tokens'].to(device)
         future_mask = batch['future_mask'].to(device)
+        times = batch["times"].to(device)   # 追加
+
         
         # 滞在カウント計算
         prefix_stay_counts = tokenizer.calculate_stay_counts(prefix_tokens).to(device)
@@ -541,6 +573,8 @@ for epoch in range(wandb.config.epochs):
         K = (~future_mask).sum(dim=1).max().item()
         if K == 0:
             continue
+        n_train_used += 1
+
         
         # ★ Forward (自律ロールアウト)
         outputs = model.forward_rollout(
@@ -553,6 +587,7 @@ for epoch in range(wandb.config.epochs):
             K=K,
             future_tokens=future_tokens[:, :K],
             prefix_mask=prefix_mask,
+            prefix_times=times,
         )
         
         pred_logits = outputs['pred_logits']  # [B, K, vocab]
@@ -620,13 +655,14 @@ for epoch in range(wandb.config.epochs):
         pbar.set_postfix({"loss": f"{total_loss.item():.4f}"})
     
     # Train平均
-    n_train = len(train_loader)
-    history["train_loss"].append(epoch_metrics_train["loss"] / n_train)
-    history["train_ce"].append(epoch_metrics_train["ce"] / n_train)
-    history["train_geo"].append(epoch_metrics_train["geo"] / n_train)
-    history["train_count"].append(epoch_metrics_train["count"] / n_train)
-    history["train_mode"].append(epoch_metrics_train["mode"] / n_train)
-    history["train_lyap"].append(epoch_metrics_train["lyap"] / n_train)
+    # n_train = len(train_loader)
+    den = max(n_train_used, 1)
+    history["train_loss"].append(epoch_metrics_train["loss"] / den)
+    history["train_ce"].append(epoch_metrics_train["ce"] / den)
+    history["train_geo"].append(epoch_metrics_train["geo"] / den)
+    history["train_count"].append(epoch_metrics_train["count"] / den)
+    history["train_mode"].append(epoch_metrics_train["mode"] / den)
+    history["train_lyap"].append(epoch_metrics_train["lyap"] / den)
     
     # --- Validation ---
     model.eval()
@@ -646,12 +682,15 @@ for epoch in range(wandb.config.epochs):
             
             future_tokens = batch['future_tokens'].to(device)
             future_mask = batch['future_mask'].to(device)
+            times = batch["times"].to(device)
             
             prefix_stay_counts = tokenizer.calculate_stay_counts(prefix_tokens).to(device)
+
             
             K = (~future_mask).sum(dim=1).max().item()
             if K == 0:
                 continue
+            n_val_used += 1
             
             outputs = model.forward_rollout(
                 prefix_tokens=prefix_tokens,
@@ -663,6 +702,7 @@ for epoch in range(wandb.config.epochs):
                 K=K,
                 future_tokens=future_tokens[:, :K],
                 prefix_mask=prefix_mask,
+                prefix_times=times,
             )
             
             pred_logits = outputs['pred_logits']
@@ -712,13 +752,14 @@ for epoch in range(wandb.config.epochs):
             epoch_metrics_val["lyap"] += lyap_loss.item()
     
     # Val平均
-    n_val = len(val_loader)
-    history["val_loss"].append(epoch_metrics_val["loss"] / n_val)
-    history["val_ce"].append(epoch_metrics_val["ce"] / n_val)
-    history["val_geo"].append(epoch_metrics_val["geo"] / n_val)
-    history["val_count"].append(epoch_metrics_val["count"] / n_val)
-    history["val_mode"].append(epoch_metrics_val["mode"] / n_val)
-    history["val_lyap"].append(epoch_metrics_val["lyap"] / n_val)
+    # n_val = len(val_loader)
+    den = max(n_val_used, 1)
+    history["val_loss"].append(epoch_metrics_val["loss"] / den)
+    history["val_ce"].append(epoch_metrics_val["ce"] / den)
+    history["val_geo"].append(epoch_metrics_val["geo"] / den)
+    history["val_count"].append(epoch_metrics_val["count"] / den)
+    history["val_mode"].append(epoch_metrics_val["mode"] / den)
+    history["val_lyap"].append(epoch_metrics_val["lyap"] / den)
     
     print(f"Epoch {epoch+1}: Train Loss = {history['train_loss'][-1]:.4f} | Val Loss = {history['val_loss'][-1]:.4f}")
 

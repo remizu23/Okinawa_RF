@@ -1,6 +1,6 @@
 """
 Inference and Evaluation Script
-KoopmanとAblationモデルの性能比較
+KoopmanとAblationモデルの性能比較（反実仮想なし）
 
 元のKP_RF_inf_path_real.pyをベースに、以下に対応：
 - 3分割データ（Train/Val/Test）の選択
@@ -34,6 +34,22 @@ from tokenization import Tokenization
 from utils_prism import summarize_dwell_metrics
 
 
+def sample_from_topk(probs_1d: torch.Tensor, k: int) -> int:
+    """Top-k のみから確率サンプリングして token id を返す。
+    probs_1d: [V] (softmax 後)
+    """
+    k = int(k)
+    if k <= 0:
+        raise ValueError(f"top-k must be >=1, got {k}")
+    V = probs_1d.numel()
+    k = min(k, V)
+    topk_probs, topk_idx = torch.topk(probs_1d, k=k, dim=0)
+    topk_probs = topk_probs / (topk_probs.sum() + 1e-12)
+    sampled_local = torch.multinomial(topk_probs, num_samples=1).item()
+    return topk_idx[sampled_local].item()
+
+
+
 # =========================================================
 # 1. Configuration
 # =========================================================
@@ -43,6 +59,13 @@ CONFIG = {
     "gpu_id": 0,
     "pad_token": 38,
     "vocab_size": 42,
+    # 生成停止トークン（<end>）。あなたの設定では <e> が 39 なのでそれに合わせる
+    "end_token": 39,
+    # <end> が出ない場合の無限ループ防止（必要なら大きくしてください）
+    "max_gen_steps": 200,
+    # Top-k サンプリングの k
+    "sample_topk_k": 39,
+
     "stay_offset": 19,
     
     # ★★★ 評価データ設定 ★★★
@@ -55,7 +78,7 @@ CONFIG = {
     # モデルパス
     "model_koopman_path": "/home/mizutani/projects/RF/runs/20260127_014201/model_weights_20260127_014201.pth",
     "model_ablation_path": "/home/mizutani/projects/RF/runs/20260127_014847/ablation_weights_20260127_014847.pth",
-    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation",
+    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation_6",
 
 
     "plot_max_samples": 1000,
@@ -418,31 +441,67 @@ class KoopmanEvaluator:
     
     def generate_trajectory(self, prompt_seq, start_time, agent_id, gen_len):
         """
-        自己回帰生成（Greedy decoding）
+        prefix(=prompt_seq) を1回だけ transformer に入れて z0 を作り、
+        以降は Koopman (A,B,u) で K=gen_len ステップ自律生成（Greedy）
         """
         with torch.no_grad():
-            # 初期化
+            # prefix だけをテンソル化（ここから先は prefix を伸ばさない）
+            tokens = torch.tensor([prompt_seq], dtype=torch.long).to(self.device)  # [1, P]
+            stay_counts = self.tokenizer.calculate_stay_counts(tokens).to(self.device)
+
+            P = len(prompt_seq)
+            holidays = torch.full((1, P), self.ctx_det.get_holiday(start_time), dtype=torch.long).to(self.device)
+            time_zones = torch.full((1, P), self.ctx_det.get_timezone(start_time), dtype=torch.long).to(self.device)
+
+            events = torch.zeros((1, P), dtype=torch.long).to(self.device)
+            for i, token in enumerate(prompt_seq):
+                events[0, i] = self.ctx_det.get_event_flag(token, start_time, self.base_N)
+
+            agent_ids = torch.tensor([agent_id], dtype=torch.long).to(self.device)
+
+            prefix_times = torch.tensor([int(start_time)], dtype=torch.long, device=self.device)  # [1]
+
+            outputs = self.model.forward_rollout(
+                prefix_tokens=tokens,
+                prefix_stay_counts=stay_counts,
+                prefix_agent_ids=agent_ids,
+                prefix_holidays=holidays,
+                prefix_time_zones=time_zones,
+                prefix_events=events,
+                prefix_times=prefix_times,
+                K=int(gen_len),
+                # future_tokens は渡さない（= 自律生成）
+            )
+
+            # outputs['pred_logits']: [1, K, vocab]
+            pred_tokens = torch.argmax(outputs["pred_logits"], dim=-1)[0].tolist()  # 長さKのlist[int]
+            return pred_tokens
+        
+    
+    def generate_trajectory_until_end(self, prompt_seq, start_time, agent_id, end_token_id, max_steps, mode="greedy", topk_k=5):
+        """
+        自己回帰生成（<end> が出るまで）
+        mode:
+          - "greedy": argmax
+          - "topk": Top-k から確率サンプリング
+        """
+        with torch.no_grad():
             current_seq = list(prompt_seq)
-            
-            for step in range(gen_len):
-                # 現在の系列をテンソルに
+
+            for _ in range(int(max_steps)):
                 tokens = torch.tensor([current_seq], dtype=torch.long).to(self.device)
                 stay_counts = self.tokenizer.calculate_stay_counts(tokens).to(self.device)
-                
-                # コンテキスト情報
+
                 seq_len = len(current_seq)
                 holidays = torch.full((1, seq_len), self.ctx_det.get_holiday(start_time), dtype=torch.long).to(self.device)
                 time_zones = torch.full((1, seq_len), self.ctx_det.get_timezone(start_time), dtype=torch.long).to(self.device)
-                
-                # イベントフラグ（各トークンごと）
+
                 events = torch.zeros((1, seq_len), dtype=torch.long).to(self.device)
                 for i, token in enumerate(current_seq):
                     events[0, i] = self.ctx_det.get_event_flag(token, start_time, self.base_N)
-                
+
                 agent_ids = torch.tensor([agent_id], dtype=torch.long).to(self.device)
-                
-                # Koopmanモデルで1ステップ予測
-                K = 1
+
                 outputs = self.model.forward_rollout(
                     prefix_tokens=tokens,
                     prefix_stay_counts=stay_counts,
@@ -450,18 +509,28 @@ class KoopmanEvaluator:
                     prefix_holidays=holidays,
                     prefix_time_zones=time_zones,
                     prefix_events=events,
-                    K=K,
+                    K=1,
                 )
-                
+
                 pred_logits = outputs['pred_logits'][0, 0, :]  # [vocab]
-                next_token = torch.argmax(pred_logits).item()
-                
+                probs = F.softmax(pred_logits, dim=0)
+
+                if mode == "greedy":
+                    next_token = torch.argmax(pred_logits).item()
+                elif mode == "topk":
+                    next_token = sample_from_topk(probs, k=topk_k)
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
                 current_seq.append(next_token)
-            
-            # Promptを除いた生成部分のみ返す
+
+                if next_token == int(end_token_id):
+                    break
+
             generated = current_seq[len(prompt_seq):]
             return generated
-    
+
+
     def calc_next_token_metrics(self, prompt_seq, gt_next, start_time, agent_id):
         """
         次トークン予測の精度・確率を計算
@@ -479,6 +548,8 @@ class KoopmanEvaluator:
                 events[0, i] = self.ctx_det.get_event_flag(token, start_time, self.base_N)
             
             agent_ids = torch.tensor([agent_id], dtype=torch.long).to(self.device)
+
+            prefix_times = torch.tensor([int(start_time)], dtype=torch.long, device=self.device)  # [1]
             
             outputs = self.model.forward_rollout(
                 prefix_tokens=tokens,
@@ -488,6 +559,7 @@ class KoopmanEvaluator:
                 prefix_time_zones=time_zones,
                 prefix_events=events,
                 K=1,
+                prefix_times=prefix_times,   
             )
             
             pred_logits = outputs['pred_logits'][0, 0, :]  # [vocab]
@@ -542,6 +614,71 @@ class AblationEvaluator:
             generated = current_seq[len(prompt_seq):]
             return generated
     
+    
+
+    def generate_trajectory_until_end(
+        self, prompt_seq, start_time, agent_id,
+        end_token_id, max_steps,
+        mode="greedy", topk_k=5, rng=None
+        ):
+        """自己回帰生成（Greedy / Top-k sampling, <end> が出るまで）"""
+        if rng is None:
+            rng = np.random.default_rng(0)  # 再現性が欲しくないなら seed を変える/Noneに
+
+        with torch.no_grad():
+            current_seq = list(prompt_seq)
+
+            for _ in range(int(max_steps)):
+                tokens = torch.tensor([current_seq], dtype=torch.long).to(self.device)
+                stay_counts = self.tokenizer.calculate_stay_counts(tokens).to(self.device)
+
+                seq_len = len(current_seq)
+                holidays = torch.full((1, seq_len), self.ctx_det.get_holiday(start_time),
+                                    dtype=torch.long).to(self.device)
+                time_zones = torch.full((1, seq_len), self.ctx_det.get_timezone(start_time),
+                                        dtype=torch.long).to(self.device)
+
+                events = torch.zeros((1, seq_len), dtype=torch.long).to(self.device)
+                for i, token in enumerate(current_seq):
+                    events[0, i] = self.ctx_det.get_event_flag(token, start_time, self.base_N)
+
+                agent_ids = torch.tensor([agent_id], dtype=torch.long).to(self.device)
+
+                next_logits = self.model.generate_next_token(
+                    tokens, stay_counts, agent_ids,
+                    holidays, time_zones, events
+                )  # shape: [1, vocab] 想定
+
+                logits_1d = next_logits[0]  # [vocab]
+
+                if mode == "greedy":
+                    next_token = torch.argmax(logits_1d).item()
+
+                elif mode in ("topk", "topk_sampling", "sample_topk"):
+                    k = int(topk_k)
+                    vocab = logits_1d.shape[0]
+                    k = max(1, min(k, vocab))
+
+                    # 上位kのlogitsを取り出して、その範囲でsoftmax→サンプリング
+                    topk_vals, topk_idx = torch.topk(logits_1d, k=k)
+                    topk_probs = F.softmax(topk_vals, dim=0).detach().cpu().numpy()
+
+                    # numpyでサンプリング（GPU↔CPU転送はtopkのk個だけ）
+                    pick = rng.choice(k, p=topk_probs)
+                    next_token = int(topk_idx[pick].item())
+
+                else:
+                    raise ValueError(f"Unknown mode: {mode}")
+
+                current_seq.append(next_token)
+
+                if next_token == int(end_token_id):
+                    break
+
+            generated = current_seq[len(prompt_seq):]
+            return generated
+
+
     def calc_next_token_metrics(self, prompt_seq, gt_next, start_time, agent_id):
         """次トークン予測の精度・確率を計算"""
         with torch.no_grad():
@@ -752,7 +889,44 @@ def main():
             
             pred_k = eval_koopman.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
             pred_a = eval_ablation.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
-            
+
+            # ★追加: <end>が出るまで最後まで生成（Koopman/Ablation）
+            pred_k_full = []
+            pred_a_full = []
+            pred_k_sample_topk = []
+            pred_a_sample_topk = []
+
+            # if idx < 400:
+            #     pred_k_full = eval_koopman.generate_trajectory_until_end(
+            #         prompt_seq, start_time, agent_id,
+            #         end_token_id=CONFIG["end_token"],
+            #         max_steps=CONFIG["max_gen_steps"],
+            #         mode="greedy",
+            #     )
+            #     pred_a_full = eval_ablation.generate_trajectory_until_end(
+            #         prompt_seq, start_time, agent_id,
+            #         end_token_id=CONFIG["end_token"],
+            #         max_steps=CONFIG["max_gen_steps"],
+            #     )
+
+            #     # ★追加: Top-k 確率サンプリングで <end> まで生成（Koopmanのみ）
+            #     pred_k_sample_topk = eval_koopman.generate_trajectory_until_end(
+            #         prompt_seq, start_time, agent_id,
+            #         end_token_id=CONFIG["end_token"],
+            #         max_steps=CONFIG["max_gen_steps"],
+            #         mode="topk",
+            #         topk_k=CONFIG["sample_topk_k"],
+            #     )
+                
+            #     # ★追加: Top-k 確率サンプリングで <end> まで生成（Ablation）
+            #     pred_a_sample_topk = eval_ablation.generate_trajectory_until_end(
+            #         prompt_seq, start_time, agent_id,
+            #         end_token_id=CONFIG["end_token"],
+            #         max_steps=CONFIG["max_gen_steps"],
+            #         mode="topk",
+            #         topk_k=CONFIG["sample_topk_k"],
+            #     )
+
             # 滞在指標
             stay_metrics_k = calc_stay_metrics_pair(gt_future, pred_k, NODE_DISTANCES)
             stay_metrics_a = calc_stay_metrics_pair(gt_future, pred_a, NODE_DISTANCES)
@@ -763,12 +937,47 @@ def main():
             # ★NEW: DwellU指標（圧縮版+実時間版）
             dwell_metrics_k = summarize_dwell_metrics(pred_k, gt_future, base_N=base_N)
             dwell_metrics_a = summarize_dwell_metrics(pred_a, gt_future, base_N=base_N)
+
+            # =====================================================
+            # [ADD] CSVに出したい「ルート付帯情報」
+            # =====================================================
+
+            # time_arr（このスクリプトでは各系列の start_time = time_arr[idx]）
+            time_value = int(start_time)
+
+            # 入力条件（全5列）
+            is_night = int(ctx_det.get_timezone(start_time))     # 1:夜, 0:昼
+            is_holiday = int(ctx_det.get_holiday(start_time))    # 1:休日, 0:平日
+
+            event_nodes = set(ctx_det.get_event_nodes(start_time))  # その時刻で有効なイベントノード
+            plaza_2  = 1 if 2  in event_nodes else 0
+            plaza_11 = 1 if 11 in event_nodes else 0
+            plaza_14 = 1 if 14 in event_nodes else 0
+
+            # 経路の最初/最後のトークン（padding除去後の seq を使う）
+            first_token = int(seq[0])
+            last_token  = int(seq[-1])
+
             
             # メトリクス保存
             metrics_list.append({
                 'id': idx,
                 'prefix_len': prefix_len,
                 'gen_len': gen_len,
+                # --- [ADD] 付帯情報 ---
+                'time_arr': time_value,
+
+                # 入力条件（全5列）
+                'is_night': is_night,           # 1:夜, 0:昼
+                'is_holiday': is_holiday,       # 1:休日, 0:平日
+                'plaza_node2': plaza_2,         # 1:有, 0:無
+                'plaza_node11': plaza_11,       # 1:有, 0:無
+                'plaza_node14': plaza_14,       # 1:有, 0:無
+
+                # 経路端点
+                'first_token': first_token,
+                'last_token': last_token,
+
                 
                 # 次トークン予測
                 'k_acc': 1 if acc_k else 0,
@@ -827,6 +1036,12 @@ def main():
                 'gt': gt_future,
                 'pred_k': pred_k,
                 'pred_a': pred_a,
+                # ★追加: 最後まで生成した経路
+                'pred_k_full': pred_k_full,
+                'pred_a_full': pred_a_full,
+                # ★追加: Top-k サンプリングで最後まで生成した経路（Koopman）
+                'pred_k_sample_topk': pred_k_sample_topk,
+                'pred_a_sample_topk': pred_a_sample_topk,
             })
         
         # DataFrameに変換

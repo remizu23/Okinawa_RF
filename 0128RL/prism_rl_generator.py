@@ -4,6 +4,10 @@ Prism-RL Path Generator
 Prism-constrained Recursive Logit モデルによる経路生成
 学習済みパラメータを用いて O→D の最尤経路を生成
 
+Reference:
+Oyama, Y. (2023). Capturing positive network attributes during the estimation 
+of recursive logit models: A prism-based approach. 
+Transportation Research Part C, 147, 104014.
 """
 
 import numpy as np
