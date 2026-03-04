@@ -9,7 +9,7 @@ Koopman Mode Decomposition Analysis for DKP_RF (Original Model / No Jumps)
 2. 各ステップでの潜在状態z_tを固有空間射影
 3. 重みベクトルの固有空間寄与分析
 4. トークン選択確率と広場有無の差分可視化
-5. Greedy生成による5ステップ分の横並び可視化 ★★★長期/短期モードのトークン別合計寄与(表示が変)・積み上げ棒グラフ★★★
+5. Greedy生成による5ステップ分の横並び可視化
 6. ★追加: Koopman Biplot (z軌跡とトークン重みの同時プロット)
 """
 
@@ -299,96 +299,167 @@ def encode_prefix_with_plaza(model, tokenizer, prefix, agent_id, holiday, time_z
 
 def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix,
                                   scenario, num_steps, device, out_dir):
-    """Greedyロールアウトしながら解析"""
+    """Greedyロールアウトしながら解析
+
+    ★更新:
+    - これまでは「with」で生成した経路（current_node）に合わせて movable を作り、
+      その上で with/without の確率分布を比較していた。
+    - 今回は「with経路」と「without経路」をそれぞれ生成し、
+      それぞれの経路に整合した movable 上で同じフォーマットの比較図を2枚出力する。
+      (tag='withpath' / 'wopath')
+    """
     print(f"\n{'='*60}")
     print(f"Analyzing Scenario: {scenario['name']}")
     print(f"{'='*60}")
-    
+
     prefix = scenario['prefix']
     agent_id = scenario['agent_id']
     holiday = scenario['holiday']
     time_zone = scenario['time_zone']
     plaza_tokens = scenario.get('plaza_node_tokens', [])
-    
-    # 初期エンコード
+
+    # 初期エンコード（with / without）
     z_with = encode_prefix_with_plaza(model, tokenizer, prefix, agent_id, holiday, time_zone, plaza_tokens, True, device).cpu().numpy()
     z_without = encode_prefix_with_plaza(model, tokenizer, prefix, agent_id, holiday, time_zone, plaza_tokens, False, device).cpu().numpy()
-    
+
     z_with = np.asarray(z_with).reshape(-1)
     z_without = np.asarray(z_without).reshape(-1)
-    
-    step_data = []
-    current_node = prefix[-1] % 19
+
+    # 経路ごとの current_node を別々に持つ
+    current_node_withpath = prefix[-1] % 19
+    current_node_wopath = prefix[-1] % 19
+
     generated_with = []
     generated_without = []
-    
+
+    step_data_withpath = []
+    step_data_wopath = []
+
+    ended_with = False
+    ended_wo = False
+
     A_np = analyzer.model.A.detach().cpu().numpy()
-    
+
     for step in range(num_steps):
         print(f"\n--- Step {step+1}/{num_steps} ---")
-        
+
+        # 潜在は自律系なので経路に依らず更新（同時に進める）
         z_next_with = A_np @ z_with
         z_next_without = A_np @ z_without
-        
+
         alpha_with = analyzer.transform_to_eigenspace(z_next_with)
         alpha_without = analyzer.transform_to_eigenspace(z_next_without)
-        
-        movable_tokens = get_movable_tokens(current_node, adj_matrix)
-        
+
         logits_with = analyzer.W @ z_next_with + analyzer.b
         logits_without = analyzer.W @ z_next_without + analyzer.b
-        
+
         probs_with = softmax_np(logits_with)
         probs_without = softmax_np(logits_without)
 
-        # ★変更: 「選択肢（movable_tokens）の範囲」を分母にして再正規化
-        movable_probs_with = probs_with[movable_tokens]
-        movable_probs_without = probs_without[movable_tokens]
-        movable_probs_with = movable_probs_with / max(movable_probs_with.sum(), 1e-12)
-        movable_probs_without = movable_probs_without / max(movable_probs_without.sum(), 1e-12)
-        movable_probs_diff = movable_probs_with - movable_probs_without
-        
-        next_token_with = movable_tokens[np.argmax(movable_probs_with)]
-        next_token_without = movable_tokens[np.argmax(movable_probs_without)]
-        
-        generated_with.append(next_token_with)
-        generated_without.append(next_token_without)
-        
-        print(f"  Current node: {current_node}")
-        print(f"  Selected (with): {get_token_label(next_token_with, tokenizer)} (p={movable_probs_with.max():.4f})")
-        
-        step_data.append({
-            'step': step,
-            'z_with': z_next_with.copy(),
-            'z_without': z_next_without.copy(),
-            'alpha_with': alpha_with.copy(),
-            'alpha_without': alpha_without.copy(),
-            'movable_tokens': movable_tokens.copy(),
-            'movable_probs_with': movable_probs_with.copy(),
-            'movable_probs_without': movable_probs_without.copy(),
-            'movable_probs_diff': movable_probs_diff.copy(),
-            'next_token_with': next_token_with,
-            'next_token_without': next_token_without,
-        })
-        
+        # ==========================
+        # 1) with 経路での比較（従来の図）
+        # ==========================
+        if not ended_with:
+            movable_tokens = get_movable_tokens(current_node_withpath, adj_matrix)
+
+            # 「選択肢（movable）の範囲」を分母にして再正規化
+            movable_probs_with = probs_with[movable_tokens]
+            movable_probs_without = probs_without[movable_tokens]
+            movable_probs_with = movable_probs_with / max(movable_probs_with.sum(), 1e-12)
+            movable_probs_without = movable_probs_without / max(movable_probs_without.sum(), 1e-12)
+            movable_probs_diff = movable_probs_with - movable_probs_without
+
+            next_token_with = movable_tokens[int(np.argmax(movable_probs_with))]
+            next_token_without_on_withpath = movable_tokens[int(np.argmax(movable_probs_without))]
+
+            generated_with.append(next_token_with)
+
+            print(f"  [withpath] Current node: {current_node_withpath}")
+            print(f"  [withpath] Selected (with): {get_token_label(next_token_with, tokenizer)} (p={movable_probs_with.max():.4f})")
+
+            step_data_withpath.append({
+                'step': step,
+                'z_with': z_next_with.copy(),
+                'z_without': z_next_without.copy(),
+                'alpha_with': alpha_with.copy(),
+                'alpha_without': alpha_without.copy(),
+                'movable_tokens': movable_tokens.copy(),
+                'movable_probs_with': movable_probs_with.copy(),
+                'movable_probs_without': movable_probs_without.copy(),
+                'movable_probs_diff': movable_probs_diff.copy(),
+                'next_token_with': next_token_with,
+                'next_token_without': next_token_without_on_withpath,
+            })
+
+            # withpath の current_node 更新（with が選んだトークンで進む）
+            if next_token_with < 19:
+                current_node_withpath = next_token_with
+            elif 19 <= next_token_with <= 37:
+                current_node_withpath = next_token_with - 19
+            else:
+                ended_with = True
+
+        # ==========================
+        # 2) w/o 経路での比較（新しい図）
+        # ==========================
+        if not ended_wo:
+            movable_tokens_wo = get_movable_tokens(current_node_wopath, adj_matrix)
+
+            movable_probs_with_on_wo = probs_with[movable_tokens_wo]
+            movable_probs_wo = probs_without[movable_tokens_wo]
+            movable_probs_with_on_wo = movable_probs_with_on_wo / max(movable_probs_with_on_wo.sum(), 1e-12)
+            movable_probs_wo = movable_probs_wo / max(movable_probs_wo.sum(), 1e-12)
+            movable_probs_diff_wo = movable_probs_with_on_wo - movable_probs_wo
+
+            next_token_wo = movable_tokens_wo[int(np.argmax(movable_probs_wo))]
+            next_token_with_on_wopath = movable_tokens_wo[int(np.argmax(movable_probs_with_on_wo))]
+
+            generated_without.append(next_token_wo)
+
+            print(f"  [wopath] Current node: {current_node_wopath}")
+            print(f"  [wopath] Selected (w/o): {get_token_label(next_token_wo, tokenizer)} (p={movable_probs_wo.max():.4f})")
+
+            step_data_wopath.append({
+                'step': step,
+                'z_with': z_next_with.copy(),
+                'z_without': z_next_without.copy(),
+                'alpha_with': alpha_with.copy(),
+                'alpha_without': alpha_without.copy(),
+                'movable_tokens': movable_tokens_wo.copy(),
+                'movable_probs_with': movable_probs_with_on_wo.copy(),
+                'movable_probs_without': movable_probs_wo.copy(),
+                'movable_probs_diff': movable_probs_diff_wo.copy(),
+                'next_token_with': next_token_with_on_wopath,
+                'next_token_without': next_token_wo,
+            })
+
+            # wopath の current_node 更新（w/o が選んだトークンで進む）
+            if next_token_wo < 19:
+                current_node_wopath = next_token_wo
+            elif 19 <= next_token_wo <= 37:
+                current_node_wopath = next_token_wo - 19
+            else:
+                ended_wo = True
+
+        # 潜在更新（自律なので常に進める）
         z_with = z_next_with
         z_without = z_next_without
-        
-        if next_token_with < 19:
-            current_node = next_token_with
-        elif 19 <= next_token_with <= 37:
-            current_node = next_token_with - 19
-        else:
-            print(f"  End token selected, stopping.")
-            break
-    
-    # 既存のロールアウト可視化
-    visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir)
 
-    # ★更新: Koopman Biplot (全モードを2次元ペアでまとめて可視化)
-    visualize_koopman_biplot_grid(analyzer, step_data, scenario, tokenizer, out_dir)
-    
+        if ended_with and ended_wo:
+            print("  Both paths ended, stopping.")
+            break
+
+    # --- 図出力 ---
+    if len(step_data_withpath) > 0:
+        visualize_rollout_analysis(analyzer, step_data_withpath, scenario, tokenizer, out_dir, tag="withpath")
+        # biplot は従来通り withpath を採用（最小変更）
+        visualize_koopman_biplot_grid(analyzer, step_data_withpath, scenario, tokenizer, out_dir)
+
+    if len(step_data_wopath) > 0:
+        visualize_rollout_analysis(analyzer, step_data_wopath, scenario, tokenizer, out_dir, tag="wopath")
+
     print(f"\nGenerated sequence (with plaza): {prefix} -> {generated_with}")
+    print(f"Generated sequence (w/o plaza):  {prefix} -> {generated_without}")
 
 
 
@@ -423,7 +494,7 @@ def _add_long_short_inset_heatmaps(fig, parent_ax, long_vals, short_vals, vlim, 
     return im_l, im_s
 
 
-def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir):
+def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir, tag="withpath"):
     """ロールアウト解析結果を可視化（5ステップ横並び）"""
     num_steps = len(step_data)
     z_dim = analyzer.z_dim
@@ -431,7 +502,7 @@ def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir
     fig = plt.figure(figsize=(num_steps * 6, 28))
     gs = gridspec.GridSpec(6, num_steps, figure=fig, hspace=0.35, wspace=0.25,
                           top=0.96, bottom=0.04, left=0.05, right=0.98)
-    fig.suptitle(f"Koopman Mode Decomposition Analysis: {scenario['name']}", fontsize=24, weight='bold')
+    fig.suptitle(f"Koopman Mode Decomposition Analysis ({tag}): {scenario['name']}", fontsize=24, weight='bold')
     
     # スケール計算用の収集
     all_alpha_vals = []
@@ -569,10 +640,10 @@ def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir
         p_wo_short   = p_wo   - p_wo_long
 
         w = 0.3
-        ax5.bar(x - 0.15, p_with_long,  w, label='With (long)',  color='coral')
-        ax5.bar(x - 0.15, p_with_short, w, bottom=p_with_long,  label='With (short)', color='lightsalmon')
-        ax5.bar(x + 0.15, p_wo_long,    w, label='W/o (long)',   color='steelblue')
-        ax5.bar(x + 0.15, p_wo_short,   w, bottom=p_wo_long,    label='W/o (short)',  color='lightskyblue')
+        ax5.bar(x - 0.15, p_with_long,  w, label='With (long)',  color='steelblue')
+        ax5.bar(x - 0.15, p_with_short, w, bottom=p_with_long,  label='With (short)', color='lightskyblue')
+        ax5.bar(x + 0.15, p_wo_long,    w, label='W/o (long)',   color='coral')
+        ax5.bar(x + 0.15, p_wo_short,   w, bottom=p_wo_long,    label='W/o (short)',  color='lightsalmon')
 
         ax5.set_xticks(x); ax5.set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
         ax5.set_title("⑤ Probabilities (long/short stacked)", fontsize=11); ax5.set_ylim(0, prob_vmax * 1.1)
@@ -595,7 +666,7 @@ def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir
     if last_im_Wdiff is not None and len(row_Wdiff_axes) > 0:
         fig.colorbar(last_im_Wdiff, ax=row_Wdiff_axes, fraction=0.02, pad=0.01)
 
-    save_path = os.path.join(out_dir, f"{scenario['name']}_rollout_analysis.png")
+    save_path = os.path.join(out_dir, f"{scenario['name']}_rollout_analysis_{tag}.png")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {save_path}")

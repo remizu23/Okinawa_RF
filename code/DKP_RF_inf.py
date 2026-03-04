@@ -78,7 +78,7 @@ CONFIG = {
     # モデルパス
     "model_koopman_path": "/home/mizutani/projects/RF/runs/20260127_014201/model_weights_20260127_014201.pth",
     "model_ablation_path": "/home/mizutani/projects/RF/runs/20260127_014847/ablation_weights_20260127_014847.pth",
-    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation_6",
+    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation_0303_thr8",
 
 
     "plot_max_samples": 1000,
@@ -87,7 +87,7 @@ CONFIG = {
     "prefix_lengths": [5],  # 複数のPrefix長で評価
     
     # ★★★ 短期/長期の閾値 ★★★
-    "short_long_threshold": 5,  # これ以下が短期、より大きいが長期
+    "short_long_threshold": 8,  # gen_lenの長期・短期の閾値
     
     # Context Logic
     "holidays": [20240928, 20240929, 20251122, 20251123],
@@ -131,17 +131,19 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
-def build_distance_matrix(adj_map):
-    G = nx.Graph()
-    for u, neighbors in adj_map.items():
-        for v in neighbors:
-            G.add_edge(u, v)
-    return dict(nx.all_pairs_shortest_path_length(G))
-
-NODE_DISTANCES = build_distance_matrix(ADJACENCY_MAP)
+def build_distance_matrix(adj_map):  #　adj_mapは ノード：[隣接ノード]　の形の辞書．
+    G = nx.Graph()  # network xのグラフを作成
+    for u, neighbors in adj_map.items():  # 辞書の（キー(u)，要素(neighbors)）を順に取り出す．
+        for v in neighbors:  # uのneighborsの要素vを順に取り出す．
+            G.add_edge(u, v)  # グラフの(u,v)に辺を追加する
+    return dict(nx.all_pairs_shortest_path_length(G))  # 最短距離の行列を作成．
 
 
-def get_node_id(token, stay_offset=19, pad_token=38):
+NODE_DISTANCES = build_distance_matrix(ADJACENCY_MAP) # NODE_DISTANCES[u][v] = uv間の最短距離
+
+# このNODE_DISTANCESを下記の地理コスト計算関数の中で用いる．
+
+def get_node_id(token, stay_offset=19, pad_token=38): # 単純な場合分けにより，node番号を取得
     if token == pad_token:
         return -1
     if token >= stay_offset and token < pad_token:
@@ -151,7 +153,7 @@ def get_node_id(token, stay_offset=19, pad_token=38):
     return -1
 
 
-def get_geo_cost(t1, t2, stay_offset=19, pad_token=38):
+def get_geo_cost(t1, t2, stay_offset=19, pad_token=38): # token1,2から，距離に基づいた0~1のコストを返す
     """地理的コスト計算（既存: 距離に応じて0.3, 0.6等）"""
     n1 = get_node_id(t1, stay_offset, pad_token)
     n2 = get_node_id(t2, stay_offset, pad_token)
@@ -170,7 +172,7 @@ def get_geo_cost(t1, t2, stay_offset=19, pad_token=38):
     else:
         return 1.0
 
-def get_geo_cost_relaxed(t1, t2, stay_offset=19, pad_token=38):
+def get_geo_cost_relaxed(t1, t2, stay_offset=19, pad_token=38): # token1,2から，距離に基づいた0~1のコストを返す
     """
     ★変更: 緩めの地理的コスト計算
     1hopまで(隣接ノードまで)は「コスト0」
@@ -192,7 +194,7 @@ def get_geo_cost_relaxed(t1, t2, stay_offset=19, pad_token=38):
     except KeyError:
         return 1.0
 
-def get_stay_events(seq, stay_offset=19, pad_token=38):
+def get_stay_events(seq, stay_offset=19, pad_token=38): # いつからいつまでどこに滞在していたか，の辞書を返す
     """
     数列から滞在イベントを抽出
     Returns: list of dict {'start': int, 'end': int, 'node': int, 'dur': int}
@@ -202,25 +204,27 @@ def get_stay_events(seq, stay_offset=19, pad_token=38):
     i = 0
     while i < n:
         token = seq[i]
-        if stay_offset <= token < pad_token:
+        if stay_offset <= token < pad_token: # i番目が滞在ならば：
             start = i
             node_id = token - stay_offset
-            while i < n and seq[i] == token:
+            while i < n and seq[i] == token: # 同じ滞在トークンが続く限りループ
                 i += 1
             end = i
             duration = end - start
-            events.append({
+            events.append({ # 「いつからいつまでどこに」滞在，を追加
                 'start': start,
                 'end': end,
                 'node': node_id,
                 'dur': duration
             })
-        else:
+        else: # i番目が移動トークン
             i += 1
     return events
 
+# 滞在のタイミングがoverlapしているものを抽出し，それらの間の持続長やノード間距離などを取得し，
+# [{detected:~, len_diff:~, loc_dist:~, gt_dur:~, gt_node:~},...]の辞書を返す
 
-def calc_stay_metrics_pair(gt_seq, pred_seq, node_dists):
+def calc_stay_metrics_pair(gt_seq, pred_seq, node_dists): 
     """
     GTと予測の滞在イベントをマッチングし、指標を計算
     """
@@ -234,14 +238,14 @@ def calc_stay_metrics_pair(gt_seq, pred_seq, node_dists):
         max_overlap = 0
         
         for pred_e in pred_events:
-            overlap_start = max(gt_e['start'], pred_e['start'])
+            overlap_start = max(gt_e['start'], pred_e['start']) # ここの計算で，overlapを計算している．
             overlap_end = min(gt_e['end'], pred_e['end'])
             overlap = max(0, overlap_end - overlap_start)
             
             if overlap > 0:
                 if overlap > max_overlap:
                     max_overlap = overlap
-                    best_match = pred_e
+                    best_match = pred_e  # ここにbest_matchが入ることで，次の指標計算がされる
         
         metric = {
             'detected': False,
@@ -257,14 +261,14 @@ def calc_stay_metrics_pair(gt_seq, pred_seq, node_dists):
             
             u, v = gt_e['node'], best_match['node']
             if u == v:
-                dist = 0
+                dist = 0  # 同じノードなら距離0
             elif u in node_dists and v in node_dists[u]:
-                dist = node_dists[u][v]
+                dist = node_dists[u][v]  # ノード間距離を取得
             else:
                 dist = 999
             metric['loc_dist'] = dist
         else:
-            metric['len_diff'] = -gt_e['dur']
+            metric['len_diff'] = -gt_e['dur'] # ????
             metric['loc_dist'] = None
         
         results.append(metric)
@@ -281,17 +285,21 @@ def summarize_stay(metrics_list, alpha=1.5, dist_thresh=3):
     if not metrics_list:
         return None, None, None, None, None
     
-    detected = [m for m in metrics_list if m['detected']]
-    if not detected:
+    detected = [m for m in metrics_list if m['detected']] # m：metrics_listの要素{detected:~,...}の組のうち，detectedがTrueのもの
+    if not detected:  # if notとかあるのか．
         return 0.0, None, None, None, None
     
     det_rate = len(detected) / len(metrics_list)
+    # 出力①
+    # det_rate：滞在イベントのうちどれくらい検出できたか．ここで，検出＝時間的なoverlap．
+    # →場所にはゆるく，時間的タイミングの一致度には厳しい指標．
     
-    diffs = [m['len_diff'] for m in detected]
-    dists = [m['loc_dist'] for m in detected]
+    diffs = [m['len_diff'] for m in detected] # 検出した滞在イベントのlen_diffのリスト
+    dists = [m['loc_dist'] for m in detected] # 検出した滞在イベントのloc_distのリスト
     
+    # 出力②〜④
     mean_len_diff = np.mean(diffs)
-    mean_len_abs = np.mean(np.abs(diffs))
+    mean_len_abs = np.mean(np.abs(diffs)) # len_diffのプラマイ（＝過大/過小評価）関係なし．
     mean_loc_dist = np.mean(dists)
     
     # 統合コスト
@@ -301,15 +309,16 @@ def summarize_stay(metrics_list, alpha=1.5, dist_thresh=3):
         abs_l = abs(m['len_diff'])
         
         if d > dist_thresh:
-            time_cost = m['gt_dur']
+            time_cost = m['gt_dur']  # 場所が遠すぎるなら，time_costはdurationになる(=実質，丸々不一致ということになる)
         else:
-            time_cost = abs_l
+            time_cost = abs_l  # 場所距離3以下なら，abs(len_diff)がtime_costとなる．
         
-        cost = time_cost + (alpha * d)
+        cost = time_cost + (alpha * d) # ここがキモ．統合コストの計算
         costs.append(cost)
     
-    mean_cost = np.mean(costs)
-    
+    # 出力⑤
+    mean_cost = np.mean(costs)  # metrics_listの全ての滞在イベントについて計算し平均する．
+
     return det_rate, mean_len_diff, mean_len_abs, mean_loc_dist, mean_cost
 
 
@@ -320,7 +329,7 @@ def calc_levenshtein(seq1, seq2, geo=False, relaxed=False):
     relaxed=True: 2hop以内ならコスト0とする (geo=True時のみ有効)
     """
     if not geo:
-        return Levenshtein.distance(seq1, seq2)
+        return Levenshtein.distance(seq1, seq2) # 普通のバージョンは既存のものを使う．
     else:
         # 地理的コストを使ったEdit Distance
         n, m = len(seq1), len(seq2)

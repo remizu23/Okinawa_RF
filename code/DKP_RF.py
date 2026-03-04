@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-class EmbeddingWithFeatures(nn.Module):
+class EmbeddingWithFeatures(nn.Module): # Koopmanでは不使用
     def __init__(self, vocab_size, token_dim, feature_dim=None, feature_emb_dim=None, dropout=0.1):
         super(EmbeddingWithFeatures, self).__init__()
         self.token_embedding = nn.Embedding(vocab_size, token_dim, padding_idx=38)

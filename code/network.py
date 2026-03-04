@@ -14,12 +14,10 @@ class Network:
         self.N = len(self.adj_matrix)
         self.node_id_list = [i for i in range(self.N)]
 
-        #効用関数に入れる変数の行列を作成する
+        #効用関数に入れる変数の行列を作成する（↓今回実装でほぼ使っていない．）
         # 説明変数4つの行列を挿入する
         self.feature_mat_0 = self._node_feature_matrix(feature_num = 0) 
         #self.feature_mat_1 = self._node_feature_matrix(feature_num = 1)
-
-        
 
     def _node_feature_matrix(self, feature_num):
         part_feature_mat = np.zeros((self.N, self.N))

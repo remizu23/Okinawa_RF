@@ -13,12 +13,9 @@ from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
 import matplotlib.pyplot as plt
 
-
 # ========================================
-# 設定エリア - ここを変更してください
+# 1-1. パラメータ設定【シナリオに応じて要変更①】
 # ========================================
-run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
 # WandBの設定（ダミー）
 class Dummy: pass
 wandb = Dummy()
@@ -70,10 +67,43 @@ wandb.config = type("C", (), {
     "save_split_indices": True,
 })()
 
+# =======================================================
+# 1-2. データの読み込み【シナリオに応じて要変更②】・ネットワーク作成
+# =======================================================
+
+print("\n=== Loading Data ===")
+trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5.npz')  #npzファイルの中身（辞書のように trip_arrz['route_arr'] として取り出す）
+common_split_path = "/home/mizutani/projects/RF/data/common_split_indices_m5.npz" #訓練直前，dataset作成時に参照する．
+
+adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True) #torch.loadはモデルだけじゃなくて行列もロードできる．
+expanded_adj = expand_adjacency_matrix(adj_matrix) #引数adj_matrix→移動・滞在用に拡張する．
+
+dummy_node_features = torch.zeros((len(adj_matrix), 1)) 
+expanded_features = torch.cat([dummy_node_features, dummy_node_features], dim=0)
+network = Network(expanded_adj, expanded_features)  # 拡張後のnetworkを作る．（ViRT実装時の仕様のためfeatureもついているが，使わない．）
+
+# networkを作ったが，実質，network.Nしか使っていない．使用箇所は下記2点．
+    # ①vocab_size = network.N + 4
+    # ②tokenizer = Tokenization(network)．
+        # tokenizationでも，下記のように，結局Nしか参照していない．
+        # def __init__(self, network):
+        #     self.network = network
+        #     self.num_nodes = network.N
+        #     self.SPECIAL_TOKENS = {
+        #         "<p>": self.num_nodes,  # パディングトークン
+        #         "<e>": self.num_nodes + 1,  # 終了トークン
+        #         "<b>": self.num_nodes + 2,  # 開始トークン
+        #         "<m>": self.num_nodes + 3,  # 非隣接ノードトークン
+
+
+# ========================================
+# 1-3. 計算実行環境・出力out_dirの設定
+# ========================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # --- 保存ディレクトリ ---
+run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
 out_dir = f"/home/mizutani/projects/RF/runs/{run_id}"
 os.makedirs(out_dir, exist_ok=True)
 def stamp(name): return os.path.join(out_dir, name)
@@ -81,19 +111,13 @@ def stamp(name): return os.path.join(out_dir, name)
 print(f"Run ID: {run_id}")
 print(f"Output directory: {out_dir}")
 
-# ========================================
-# データの準備
-# ========================================
-
-print("\n=== Loading Data ===")
-trip_arrz = np.load('/home/mizutani/projects/RF/data/input_real_m5.npz') 
-common_split_path = "/home/mizutani/projects/RF/data/common_split_indices_m5.npz"
-
-adj_matrix = torch.load('/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt', weights_only=True)
-
-# 距離行列計算
+# ==================================================
+# 1-4. 各種関数定義（結局使っていない．）
+# ==================================================
+# 1-4-1. 地理損失のための距離行列の作成
+# ==================================================
 import networkx as nx
-def compute_shortest_path_distance_matrix(adj, directed=False):
+def compute_shortest_path_distance_matrix(adj, directed=False): # adj(隣接行列)引数 → 最短距離の行列distを作る
     if not isinstance(adj, torch.Tensor): adj = torch.tensor(adj)
     adj_cpu = adj.detach().cpu()
     N = adj_cpu.shape[0]
@@ -110,31 +134,53 @@ def compute_shortest_path_distance_matrix(adj, directed=False):
     return dist
 
 if adj_matrix.shape[0] == 38:
-    base_N = 19
-    base_adj = adj_matrix[:base_N, :base_N]
+    base_N = 19 # 移動部分のみ
+    base_adj = adj_matrix[:base_N, :base_N] # 移動部分のみ
+
 else:
     base_adj = adj_matrix
     base_N = int(base_adj.shape[0])
+# print(f"Base N: {base_N}")
 
-print(f"Base N: {base_N}")
+dist_mat_base = compute_shortest_path_distance_matrix(base_adj, directed=False) # 移動部分のみの最短距離行列
 
-dist_mat_base = compute_shortest_path_distance_matrix(base_adj, directed=False)
-expanded_adj = expand_adjacency_matrix(adj_matrix)
-dummy_node_features = torch.zeros((len(adj_matrix), 1))
-expanded_features = torch.cat([dummy_node_features, dummy_node_features], dim=0)
-network = Network(expanded_adj, expanded_features)
+# ==================================================
+# 1-4-2. スケジュールサンプリングのサンプリング率を返す関数（u(t)使用時の残骸）
+# ==================================================
+
+def scheduled_sampling_p_tf(epoch: int) -> float: #epochから数値を返す．
+    """
+    epochに応じて teacher forcing 確率 p_tf を返す
+    """
+    if epoch < 10:
+        return 1.0
+    elif epoch < 20:
+        return 0.9
+    elif epoch < 30:
+        return 0.7
+    elif epoch < 40:
+        return 0.5
+    elif epoch < 50:
+        return 0.3
+    elif epoch < 70:
+        return 0.1
+    else:
+        return 0.05
+
+
+# ==================================================
+# 2-1. trip_arrzから配列を取り出してtorch tensor化
+# ==================================================
 
 trip_arr = trip_arrz['route_arr']
-time_arr = trip_arrz['time_arr']
-agent_ids_arr = trip_arrz['agent_ids'] if 'agent_ids' in trip_arrz else np.zeros(len(trip_arr), dtype=int)
+time_arr = trip_arrz['time_arr'] #202409281000 のような形式，分は00のみ．（経路について一つ定義）
+agent_ids_arr = trip_arrz['agent_ids'] if 'agent_ids' in trip_arrz else np.zeros(len(trip_arr), dtype=int) #不使用なので, 経路数分のnp.zeros．
+holiday_arr = trip_arrz['holiday_arr'] # 1 = holiday（各経路内の各トークンについて定義）
+timezone_arr = trip_arrz['time_zone_arr'] # 1 = night（各経路内の各トークンについて定義）
+event_arr = trip_arrz['event_arr'] # 1 = event（各経路内の各トークンについて定義）
 
-# 既存のコンテキスト配列もロード
-holiday_arr = trip_arrz['holiday_arr']
-timezone_arr = trip_arrz['time_zone_arr']
-event_arr = trip_arrz['event_arr']
-
-# Tensor化
-route_pt = torch.from_numpy(trip_arr).long()
+# それぞれtorch Tensor化（学習へ）
+route_pt = torch.from_numpy(trip_arr).long() 
 time_pt = torch.from_numpy(time_arr)
 agent_pt = torch.from_numpy(agent_ids_arr).long()
 holiday_pt = torch.from_numpy(holiday_arr).long()
@@ -144,37 +190,15 @@ event_pt = torch.from_numpy(event_arr).long()
 vocab_size = network.N + 4
 print(f"Vocabulary size: {vocab_size}")
 print(f"Number of sequences: {len(trip_arr)}")
-
-# スケジュールサンプリング
-def scheduled_sampling_p_tf(epoch: int) -> float:
-    """
-    epochに応じて teacher forcing 確率 p_tf を返す。
-    まずは安全にゆっくり下げる（手戻りが少ない設定）。
-    """
-    # 例：0-9:1.0, 10-19:0.9, 20-29:0.7, 30+:0.5
-    if epoch < 10:
-        return 1.0
-    elif epoch < 20:
-        return 0.9
-    elif epoch < 30:
-        return 0.7
-    # else:
-    #     return 0.5
-    elif epoch < 40:
-        return 0.5
-    elif epoch < 50:
-        return 0.3
-    elif epoch < 70:
-        return 0.1
-    else:
-        return 0.05
     
 
 # ========================================
-# 可変長Prefixデータセット
+# 2-2．データセット関係のクラス・関数定義
+# =========================================
+# 2-2-1．可変長のデータセットクラス：一つの経路データから複数prefixで学習できるようにする
 # ========================================
 
-class VariablePrefixDataset(torch.utils.data.Dataset):
+class VariablePrefixDataset(torch.utils.data.Dataset): # 2-2-1．可変長のデータセットクラス
     """
     1つの系列から複数の (prefix, future) ペアを作成
     """
@@ -188,7 +212,7 @@ class VariablePrefixDataset(torch.utils.data.Dataset):
         self._create_samples(routes, times, agents, holidays, timezones, events)
     
     def _create_samples(self, routes, times, agents, holidays, timezones, events):
-        for idx in range(len(routes)):
+        for idx in range(len(routes)): # idx = たくさんある経路のうち何個目か
             r = routes[idx]
             t = times[idx]
             a = agents[idx]
@@ -208,7 +232,8 @@ class VariablePrefixDataset(torch.utils.data.Dataset):
             for prefix_len in self.prefix_lengths:
                 if real_len < prefix_len + self.min_future_len:
                     continue
-                
+
+                # ①prefix_data
                 prefix_data = {
                     'tokens': r[:prefix_len],
                     'time': t,
@@ -218,6 +243,7 @@ class VariablePrefixDataset(torch.utils.data.Dataset):
                     'events': e[:prefix_len],
                 }
                 
+                # ②prefix_data
                 future_data = {
                     'tokens': r[prefix_len:real_len],
                     'holidays': h[prefix_len:real_len],
@@ -238,8 +264,11 @@ class VariablePrefixDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
+# ========================================
+# 2-2-2．固定長prefixのデータセットクラス
+# ========================================
 
-class FixedPrefixDataset(torch.utils.data.Dataset):
+class FixedPrefixDataset(torch.utils.data.Dataset): # 2-2-2．固定長prefixのデータセットクラス
     """
     固定長Prefixデータセット
     """
@@ -297,8 +326,11 @@ class FixedPrefixDataset(torch.utils.data.Dataset):
             'future_len': real_len - self.prefix_len,
         }
 
+# ========================================
+# 2-2-3．バッチ内のサンプル長を揃える関数
+# ========================================
 
-def collate_variable_prefix(batch):
+def collate_variable_prefix(batch): # 2-2-3．バッチ内のサンプル長を揃える関数
     """可変長Prefixのcollate関数"""
     max_prefix_len = max(item['prefix_len'] for item in batch)
     max_future_len = max(item['future_len'] for item in batch)
@@ -359,10 +391,9 @@ def collate_variable_prefix(batch):
         'future_mask': future_mask,
     }
 
-
-# ========================================
-# 共通分割インデックスのロード（系列レベル）
-# ========================================
+# =====================================================
+# 2-3. 訓練・検証・テストデータの系列番号を，common_splitから取得
+# =====================================================
 
 print("\n=== Loading Common Split Indices ===")
 
@@ -372,8 +403,8 @@ if not os.path.exists(common_split_path):
         "Please run 'python create_common_split.py' first!"
     )
 
-split_data = np.load(common_split_path)
-train_seq_indices = split_data['train_sequences']
+split_data = np.load(common_split_path) #split_dataとして保存．numpy配列
+train_seq_indices = split_data['train_sequences'] #３つそれぞれ，系列番号の一覧
 val_seq_indices = split_data['val_sequences']
 test_seq_indices = split_data['test_sequences']
 
@@ -381,26 +412,41 @@ print(f"Train sequences: {len(train_seq_indices)}")
 print(f"Val sequences: {len(val_seq_indices)}")
 print(f"Test sequences: {len(test_seq_indices)}")
 
-# ========================================
-# 各分割でデータセット作成
-# ========================================
+# 分割情報を保存しておく（推論時に使用(?)）
+if wandb.config.save_split_indices:
+    split_path = stamp("split_info.npz")
+    np.savez(
+        split_path,
+        train_sequences=train_seq_indices,
+        val_sequences=val_seq_indices,
+        test_sequences=test_seq_indices,
+        common_split_path=common_split_path,
+    )
+    print(f"Saved split info to: {split_path}")
+
+
+# =====================================================
+# 2-4. 取得した系列番号に従い，訓練・検証・テストデータセットを作成
+# 
+# 各系列番号のroute_pt，time_pt，・・・をVariablePrefixDatasetやFixedPrefixDatasetに代入して作る．
+# 計3回，VariablePrefixDataset or FixedPrefixDatasetを回すことで作る．
+# =====================================================
 
 print("\n=== Creating Datasets ===")
 
-# Train用データセット
-if wandb.config.use_variable_prefix:
+if wandb.config.use_variable_prefix: # データセットを作成：可変長の場合
     print(f"Using variable prefix with lengths: {wandb.config.prefix_lengths}")
-    train_dataset = VariablePrefixDataset(
-        route_pt[train_seq_indices], 
-        time_pt[train_seq_indices], 
-        agent_pt[train_seq_indices],
+    train_dataset = VariablePrefixDataset(  #①訓練
+        route_pt[train_seq_indices],  # 2-1でtorch tensor化されたtrip_arr
+        time_pt[train_seq_indices],   # 2-1でtorch tensor化されたtime_arr
+        agent_pt[train_seq_indices],  # ・・・
         holiday_pt[train_seq_indices], 
         timezone_pt[train_seq_indices], 
         event_pt[train_seq_indices],
         prefix_lengths=wandb.config.prefix_lengths,
         min_future_len=wandb.config.min_future_length,
     )
-    val_dataset = VariablePrefixDataset(
+    val_dataset = VariablePrefixDataset(  #②検証（同じことするだけ．）
         route_pt[val_seq_indices], 
         time_pt[val_seq_indices], 
         agent_pt[val_seq_indices],
@@ -410,7 +456,7 @@ if wandb.config.use_variable_prefix:
         prefix_lengths=wandb.config.prefix_lengths,
         min_future_len=wandb.config.min_future_length,
     )
-    test_dataset = VariablePrefixDataset(
+    test_dataset = VariablePrefixDataset(  #③テスト（同じことするだけ．）
         route_pt[test_seq_indices], 
         time_pt[test_seq_indices], 
         agent_pt[test_seq_indices],
@@ -420,9 +466,9 @@ if wandb.config.use_variable_prefix:
         prefix_lengths=wandb.config.prefix_lengths,
         min_future_len=wandb.config.min_future_length,
     )
-else:
+else: # データセットを作成：固定長の場合
     print(f"Using fixed prefix length: {wandb.config.fixed_prefix_length}")
-    train_dataset = FixedPrefixDataset(
+    train_dataset = FixedPrefixDataset(  #①訓練
         route_pt[train_seq_indices], 
         time_pt[train_seq_indices], 
         agent_pt[train_seq_indices],
@@ -431,7 +477,7 @@ else:
         event_pt[train_seq_indices],
         prefix_len=wandb.config.fixed_prefix_length,
     )
-    val_dataset = FixedPrefixDataset(
+    val_dataset = FixedPrefixDataset(  #②検証（同じことするだけ．）
         route_pt[val_seq_indices], 
         time_pt[val_seq_indices], 
         agent_pt[val_seq_indices],
@@ -440,7 +486,7 @@ else:
         event_pt[val_seq_indices],
         prefix_len=wandb.config.fixed_prefix_length,
     )
-    test_dataset = FixedPrefixDataset(
+    test_dataset = FixedPrefixDataset(  #③テスト（同じことするだけ．）
         route_pt[test_seq_indices], 
         time_pt[test_seq_indices], 
         agent_pt[test_seq_indices],
@@ -454,19 +500,10 @@ print(f"Train samples: {len(train_dataset)}")
 print(f"Val samples: {len(val_dataset)}")
 print(f"Test samples: {len(test_dataset)}")
 
-# ★ 分割情報を保存（推論時に使用）
-if wandb.config.save_split_indices:
-    split_path = stamp("split_info.npz")
-    np.savez(
-        split_path,
-        train_sequences=train_seq_indices,
-        val_sequences=val_seq_indices,
-        test_sequences=test_seq_indices,
-        common_split_path=common_split_path,
-    )
-    print(f"Saved split info to: {split_path}")
 
-# DataLoader
+# =====================================================
+# 2-5. データセットから，DataLoaderを作成
+# =====================================================
 train_loader = DataLoader(train_dataset, batch_size=wandb.config.batch_size, shuffle=True, 
                           collate_fn=collate_variable_prefix, drop_last=True)
 val_loader = DataLoader(val_dataset, batch_size=wandb.config.batch_size, shuffle=False, 
@@ -474,7 +511,7 @@ val_loader = DataLoader(val_dataset, batch_size=wandb.config.batch_size, shuffle
 
 
 # ========================================
-# モデル初期化
+# 3-1. モデル初期化
 # ========================================
 
 print("\n=== Initializing Model ===")
@@ -510,26 +547,27 @@ print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
 # optimizer = torch.optim.Adam(model.parameters(), lr=wandb.config.learning_rate)
 
+# weight_decayありで過学習防止
 optimizer = torch.optim.AdamW(model.parameters(), lr=wandb.config.learning_rate, weight_decay=1e-4)
 
-# Tokenizer
+# tokenizer（calculate_stay_countsで使うだけである．）
 tokenizer = Tokenization(network)
 
-# --- <e> 重み（最小追加） ---
+# --- <e> 重み ---
 END_WEIGHT = wandb.config.end_token_weight
 end_id = 39
 
-ce_class_weight = torch.ones(vocab_size, device=device, dtype=torch.float32)
-ce_class_weight[end_id] = float(END_WEIGHT)
+ce_class_weight = torch.ones(vocab_size, device=device, dtype=torch.float32) # CE重み（基本全部1(torch.ones)）
+ce_class_weight[end_id] = float(END_WEIGHT) # CE重みのend_idだけ3.0とかに（例えば）する．
 
 
 # ========================================
-# 学習ループ
+# 3-2. 訓練・検証ループ
 # ========================================
 
 print("\n=== Starting Training ===")
 
-history = {
+history = {  # 値の履歴辞書
     "train_loss": [], "val_loss": [],
     "train_ce": [], "val_ce": [],
     "train_geo": [], "val_geo": [],
@@ -539,8 +577,12 @@ history = {
 }
 
 for epoch in range(wandb.config.epochs):
-    # --- Training ---
+    # --- ①Training ---
     model.train()
+
+    # 現在epochに応じてp_tfが変わる設定．
+    # u(t)実装時のスケジュールサンプリングの名残．今，model内でp_tfは使っていないため，謎の変数定義がされて終わるだけのパート．
+    
     model.p_tf = scheduled_sampling_p_tf(epoch)
     print(f"[ScheduledSampling] epoch={epoch+1} p_tf={model.p_tf:.3f}")
     epoch_metrics_train = {
@@ -548,11 +590,14 @@ for epoch in range(wandb.config.epochs):
         "count": 0.0, "mode": 0.0, "lyap": 0.0
     }
     
+    # tqdm(dataloader，desc=[注釈文(description)])．
+    # 各エポックについて進捗表示バーが出るとともに，このpbarはtrain_loaderのように扱える．
     pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{wandb.config.epochs} [Train]")
     
     n_train_used = 0
     n_val_used = 0
-    for batch in pbar:
+
+    for batch in pbar:  # pbarはtrain_loaderのように扱える．batch内には
         # データ取得
         prefix_tokens = batch['prefix_tokens'].to(device)
         prefix_holidays = batch['prefix_holidays'].to(device)
@@ -564,17 +609,15 @@ for epoch in range(wandb.config.epochs):
         future_tokens = batch['future_tokens'].to(device)
         future_mask = batch['future_mask'].to(device)
         times = batch["times"].to(device)   # 追加
-
         
         # 滞在カウント計算
         prefix_stay_counts = tokenizer.calculate_stay_counts(prefix_tokens).to(device)
         
-        # Future の有効長
+        # Future の有効長．このKをKPRFのrolloutに代入する．
         K = (~future_mask).sum(dim=1).max().item()
         if K == 0:
             continue
         n_train_used += 1
-
         
         # ★ Forward (自律ロールアウト)
         outputs = model.forward_rollout(
@@ -584,7 +627,7 @@ for epoch in range(wandb.config.epochs):
             prefix_holidays=prefix_holidays,
             prefix_time_zones=prefix_timezones,
             prefix_events=prefix_events,
-            K=K,
+            K=K, # 上記のK．rolloutで出力する長さ．
             future_tokens=future_tokens[:, :K],
             prefix_mask=prefix_mask,
             prefix_times=times,
@@ -638,13 +681,13 @@ for epoch in range(wandb.config.epochs):
             wandb.config.lyap_alpha * lyap_loss
         )
         
-        # Backward
+        # 誤差逆伝播．
         optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
-        # 統計
+        # epoch_metrics_train["各種損失"]に，このバッチでの損失を足し合わせる．
         epoch_metrics_train["loss"] += total_loss.item()
         epoch_metrics_train["ce"] += ce_loss.item()
         epoch_metrics_train["geo"] += geo_loss.item()
@@ -654,9 +697,12 @@ for epoch in range(wandb.config.epochs):
         
         pbar.set_postfix({"loss": f"{total_loss.item():.4f}"})
     
-    # Train平均
-    # n_train = len(train_loader)
-    den = max(n_train_used, 1)
+    # ↓↓ 全バッチ分終了（＝このエポックが終了）したので ↓↓
+
+    # このエポックの訓練の成績をまとめる．
+    # 各エポックでの，損失の合計epoch_metrics_train["各種損失"]を，
+    # バッチ数で割った平均を，各エポックの損失としている．
+    den = max(n_train_used, 1)  # n_train_usedはバッチごとに1ずつ足しており，バッチ数に相当．
     history["train_loss"].append(epoch_metrics_train["loss"] / den)
     history["train_ce"].append(epoch_metrics_train["ce"] / den)
     history["train_geo"].append(epoch_metrics_train["geo"] / den)
@@ -664,7 +710,8 @@ for epoch in range(wandb.config.epochs):
     history["train_mode"].append(epoch_metrics_train["mode"] / den)
     history["train_lyap"].append(epoch_metrics_train["lyap"] / den)
     
-    # --- Validation ---
+
+    # --- ②Validation ---
     model.eval()
     epoch_metrics_val = {
         "loss": 0.0, "ce": 0.0, "geo": 0.0,
@@ -672,7 +719,8 @@ for epoch in range(wandb.config.epochs):
     }
     
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in val_loader:  # pbarはtrain_loaderのように扱える．batch内には
+            # データ取得
             prefix_tokens = batch['prefix_tokens'].to(device)
             prefix_holidays = batch['prefix_holidays'].to(device)
             prefix_timezones = batch['prefix_timezones'].to(device)
@@ -751,9 +799,11 @@ for epoch in range(wandb.config.epochs):
             epoch_metrics_val["mode"] += aux_mode_loss.item()
             epoch_metrics_val["lyap"] += lyap_loss.item()
     
-    # Val平均
+    # ↓↓ 全バッチ分終了したので ↓↓
+
+    # このエポックの検証の成績をまとめる．
     # n_val = len(val_loader)
-    den = max(n_val_used, 1)
+    den = max(n_val_used, 1)  # n_val_usedはバッチごとに1ずつ足しており，バッチ数に相当．
     history["val_loss"].append(epoch_metrics_val["loss"] / den)
     history["val_ce"].append(epoch_metrics_val["ce"] / den)
     history["val_geo"].append(epoch_metrics_val["geo"] / den)
@@ -764,7 +814,7 @@ for epoch in range(wandb.config.epochs):
     print(f"Epoch {epoch+1}: Train Loss = {history['train_loss'][-1]:.4f} | Val Loss = {history['val_loss'][-1]:.4f}")
 
 # ========================================
-# 保存処理
+# 4-1. 保存処理
 # ========================================
 
 print("\n=== Saving Model ===")
@@ -808,7 +858,7 @@ torch.save(save_data, savefilename)
 print(f"Model saved to: {savefilename}")
 
 # ========================================
-# グラフ描画
+# 4-2. グラフ描画
 # ========================================
 
 print("\n=== Plotting Loss History ===")

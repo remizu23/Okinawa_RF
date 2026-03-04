@@ -9,7 +9,7 @@ Koopman Mode Decomposition Analysis for DKP_RF (Original Model / No Jumps)
 2. 各ステップでの潜在状態z_tを固有空間射影
 3. 重みベクトルの固有空間寄与分析
 4. トークン選択確率と広場有無の差分可視化
-5. Greedy生成による5ステップ分の横並び可視化 ★★★長期/短期モードのトークン別合計寄与(表示が変)・積み上げ棒グラフ★★★
+5. Greedy生成による5ステップ分の横並び可視化
 6. ★追加: Koopman Biplot (z軌跡とトークン重みの同時プロット)
 """
 
@@ -152,7 +152,7 @@ DATA_PATH = "/home/mizutani/projects/RF/data/input_real_m5.npz"
 
 # 出力先
 RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUT_DIR = os.path.join(os.path.dirname(MODEL_PATH), f"scen2_{RUN_ID}")
+OUT_DIR = os.path.join(os.path.dirname(MODEL_PATH), f"scen2_{RUN_ID}_ms_sum")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 # デバイス
@@ -162,7 +162,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_ROLLOUT_STEPS = 15  # 何ステップ生成するか
 
 # モード分類しきい値（|λ| < thresh を短期減衰モードとみなす）
-EIG_ABS_SHORT_TERM_THRESH = 0.7
+EIG_ABS_SHORT_TERM_THRESH = 0.5
 
 
 # =========================================================
@@ -385,6 +385,9 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
     # 既存のロールアウト可視化
     visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir)
 
+    # ★追加: Move/Stay × Long/Short の全トークン寄与集約
+    plot_move_stay_longshort_contrib(analyzer, step_data, scenario, tokenizer, out_dir)
+
     # ★更新: Koopman Biplot (全モードを2次元ペアでまとめて可視化)
     visualize_koopman_biplot_grid(analyzer, step_data, scenario, tokenizer, out_dir)
     
@@ -569,10 +572,10 @@ def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir
         p_wo_short   = p_wo   - p_wo_long
 
         w = 0.3
-        ax5.bar(x - 0.15, p_with_long,  w, label='With (long)',  color='coral')
-        ax5.bar(x - 0.15, p_with_short, w, bottom=p_with_long,  label='With (short)', color='lightsalmon')
-        ax5.bar(x + 0.15, p_wo_long,    w, label='W/o (long)',   color='steelblue')
-        ax5.bar(x + 0.15, p_wo_short,   w, bottom=p_wo_long,    label='W/o (short)',  color='lightskyblue')
+        ax5.bar(x - 0.15, p_with_long,  w, label='With (long)',  color='steelblue')
+        ax5.bar(x - 0.15, p_with_short, w, bottom=p_with_long,  label='With (short)', color='lightskyblue')
+        ax5.bar(x + 0.15, p_wo_long,    w, label='W/o (long)',   color='coral')
+        ax5.bar(x + 0.15, p_wo_short,   w, bottom=p_wo_long,    label='W/o (short)',  color='lightsalmon')
 
         ax5.set_xticks(x); ax5.set_xticklabels(token_labels, rotation=45, ha='right', fontsize=7)
         ax5.set_title("⑤ Probabilities (long/short stacked)", fontsize=11); ax5.set_ylim(0, prob_vmax * 1.1)
@@ -596,6 +599,100 @@ def visualize_rollout_analysis(analyzer, step_data, scenario, tokenizer, out_dir
         fig.colorbar(last_im_Wdiff, ax=row_Wdiff_axes, fraction=0.02, pad=0.01)
 
     save_path = os.path.join(out_dir, f"{scenario['name']}_rollout_analysis.png")
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {save_path}")
+
+
+
+def plot_move_stay_longshort_contrib(analyzer, step_data, scenario, tokenizer, out_dir):
+    """各シナリオについて、
+    移動トークン群 / 滞在トークン群 への寄与を、長期/短期モードで集約して積み上げ棒グラフ表示する。
+
+    寄与の定義は既存の③（Mode×Token heatmap）と同じ:
+        contrib(token, mode) = Re(W_modal[token, mode] * alpha[mode])
+    を token 群（move / stay）と mode 群（long / short）で総和する。
+
+    出力:
+      <scenario>_move_stay_longshort_contrib.png
+    """
+    if len(step_data) == 0:
+        return
+
+    # モード分類
+    eig_abs = np.abs(analyzer.eigvals)
+    short_mask = eig_abs < EIG_ABS_SHORT_TERM_THRESH
+    long_mask = ~short_mask
+
+    # トークン分類（このスクリプト内のルールに合わせる）
+    # move: 0..18, stay: 19..37 （end=39, pad=38 は除外）
+    move_ids = np.arange(0, 19, dtype=int)
+    stay_ids = np.arange(19, 38, dtype=int)
+
+    # W_modal の行数（語彙数）に合わせてクリップ（安全策）
+    V = analyzer.W_modal.shape[0]
+    move_ids = move_ids[move_ids < V]
+    stay_ids = stay_ids[stay_ids < V]
+
+    def _sum_contrib(alpha_vec, token_ids, mode_mask):
+        # token_ids x modes の寄与を総和
+        if token_ids.size == 0:
+            return 0.0
+        Wsub = analyzer.W_modal[token_ids, :]                    # [num_tokens, z_dim]
+        C = np.real(Wsub * alpha_vec.reshape(1, -1))             # [num_tokens, z_dim]
+        return float(C[:, mode_mask].sum())
+
+    # with / w/o で集約
+    with_long = with_short = wo_long = wo_short = 0.0
+    with_long_stay = with_short_stay = wo_long_stay = wo_short_stay = 0.0
+
+    for d in step_data:
+        a_w = np.asarray(d['alpha_with']).reshape(-1)
+        a_o = np.asarray(d['alpha_without']).reshape(-1)
+
+        with_long       += _sum_contrib(a_w, move_ids, long_mask)
+        with_short      += _sum_contrib(a_w, move_ids, short_mask)
+        with_long_stay  += _sum_contrib(a_w, stay_ids, long_mask)
+        with_short_stay += _sum_contrib(a_w, stay_ids, short_mask)
+
+        wo_long         += _sum_contrib(a_o, move_ids, long_mask)
+        wo_short        += _sum_contrib(a_o, move_ids, short_mask)
+        wo_long_stay    += _sum_contrib(a_o, stay_ids, long_mask)
+        wo_short_stay   += _sum_contrib(a_o, stay_ids, short_mask)
+
+    # プロット（2パネル: with / w/o、各パネルに move と stay の2本）
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
+    fig.suptitle(f"Long/Short Contribution Sum (Move vs Stay): {scenario['name']}", fontsize=14, weight='bold')
+
+    x = np.arange(2)
+    labels = ["Move tokens", "Stay tokens"]
+
+    # with
+    ax = axes[0]
+    ax.bar(x[0], with_long,  label="Long",  color="steelblue")
+    ax.bar(x[0], with_short, bottom=with_long, color="lightskyblue", label="Short")
+    ax.bar(x[1], with_long_stay,  color="steelblue")
+    ax.bar(x[1], with_short_stay, bottom=with_long_stay, color="lightskyblue")
+    ax.axhline(0, color='k', linewidth=0.6)
+    ax.set_title("With plaza (α_with)", fontsize=11)
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=0, fontsize=10)
+    ax.set_ylabel("Total contribution (signed sum)", fontsize=10)
+    ax.legend(fontsize=9)
+
+    # w/o
+    ax = axes[1]
+    ax.bar(x[0], wo_long,  label="Long",  color="coral")
+    ax.bar(x[0], wo_short, bottom=wo_long, color="lightsalmon", label="Short")
+    ax.bar(x[1], wo_long_stay,  color="coral")
+    ax.bar(x[1], wo_short_stay, bottom=wo_long_stay, color="lightsalmon")
+    ax.axhline(0, color='k', linewidth=0.6)
+    ax.set_title("W/o plaza (α_without)", fontsize=11)
+    ax.set_xticks(x); ax.set_xticklabels(labels, rotation=0, fontsize=10)
+    ax.legend(fontsize=9)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+
+    save_path = os.path.join(out_dir, f"{scenario['name']}_move_stay_longshort_contrib.png")
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
     print(f"Saved: {save_path}")
