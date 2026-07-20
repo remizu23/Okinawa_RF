@@ -1,4 +1,19 @@
 """
+※使い方※
+
+例1: グリッド実験結果から複数モデルを選択して実行
+python /home/mizutani/projects/RF/code/DKP_RF_scen2_modified_wo_csv.py \
+  --session-root /home/mizutani/projects/RF/runs/2604_grid_experiments/grid_20260720_180128 \
+  --grid-type model_x_zdim \
+  --model-type transformer \
+  --z-dims 32,64,128
+
+例2: 特定のモデルパスを指定して実行
+python /home/mizutani/projects/RF/code/DKP_RF_scen2_modified_wo_csv.py \
+  --model-path /path/to/model_weights_*.pth
+# 出力先未指定時 → exp_dir/scen2/ に自動保存
+
+
 Koopman Mode Decomposition Analysis for DKP_RF (Original Model / No Jumps)
 
 旧モデル（Prefix-only encoding + Autonomous Koopman rollout）用の
@@ -13,15 +28,19 @@ Koopman Mode Decomposition Analysis for DKP_RF (Original Model / No Jumps)
 6. ★追加: Koopman Biplot (z軌跡とトークン重みの同時プロット)
 """
 
+import argparse
+import json
+import os
+import csv
+from datetime import datetime
+from pathlib import Path
+
 import torch
 import numpy as np
 import scipy.linalg
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 import seaborn as sns
-import os
-import csv
-from datetime import datetime
 import torch.nn.functional as F
 
 # ユーザー定義モジュール
@@ -36,60 +55,60 @@ from DKP_RF import KoopmanRoutesFormer
 
 # シナリオ定義
 SCENARIOS = [
-    {
-        "name": "2,21,21,5,24",
-        "prefix": [2,21,21,5,24],  # 初期prefix
-        "time": 20240101,
-        "agent_id": 0,
-        "holiday": 1,
-        "time_zone": 0,
-        "plaza_node_tokens": [2, 21],  # 広場として扱うノード
-    },
-    {
-        "name": "0,1,2,21,21",
-        "prefix": [0,1,2,21,21],  # 初期prefix
-        "time": 20240101,
-        "agent_id": 0,
-        "holiday": 1,
-        "time_zone": 0,
-        "plaza_node_tokens": [2, 21],  # 広場として扱うノード
-    },
-    {
-        "name": "12,10,5,2,21",
-        "prefix": [12,10,5,2,21],  # 初期prefix
-        "time": 20240101,
-        "agent_id": 0,
-        "holiday": 1,
-        "time_zone": 0,
-        "plaza_node_tokens": [2, 21],  # 広場として扱うノード
-    },
-    {
-        "name": "16,14,6,2,21",
-        "prefix": [16,14,6,2,21],
-        "time": 20240101,
-        "agent_id": 0,
-        "holiday": 1,
-        "time_zone": 0,
-        "plaza_node_tokens": [2, 21],
-    },
     # {
-    #     "name": "6,6,25,14,33",
-    #     "prefix": [6,6,25,14,33],
+    #     "name": "2,21,21,5,24",
+    #     "prefix": [2,21,21,5,24],  # 初期prefix
     #     "time": 20240101,
     #     "agent_id": 0,
-    #     "holiday": 1,              
-    #     "time_zone": 0,            
-    #     "plaza_node_tokens": [14, 33]
+    #     "holiday": 1,
+    #     "time_zone": 0,
+    #     "plaza_node_tokens": [2, 21],  # 広場として扱うノード
     # },
     # {
-    #     "name": "16,35,35,14,33",
-    #     "prefix": [16,35,35,14,33],
+    #     "name": "0,1,2,21,21",
+    #     "prefix": [0,1,2,21,21],  # 初期prefix
     #     "time": 20240101,
-    #     "holiday": 1,              
-    #     "time_zone": 0,            
     #     "agent_id": 0,
-    #     "plaza_node_tokens": [14, 33]
+    #     "holiday": 1,
+    #     "time_zone": 0,
+    #     "plaza_node_tokens": [2, 21],  # 広場として扱うノード
     # },
+    # {
+    #     "name": "12,10,5,2,21",
+    #     "prefix": [12,10,5,2,21],  # 初期prefix
+    #     "time": 20240101,
+    #     "agent_id": 0,
+    #     "holiday": 1,
+    #     "time_zone": 0,
+    #     "plaza_node_tokens": [2, 21],  # 広場として扱うノード
+    # },
+    # {
+    #     "name": "16,14,6,2,21",
+    #     "prefix": [16,14,6,2,21],
+    #     "time": 20240101,
+    #     "agent_id": 0,
+    #     "holiday": 1,
+    #     "time_zone": 0,
+    #     "plaza_node_tokens": [2, 21],
+    # },
+    {
+        "name": "6,6,25,14,33",  # 卒論最終で使用1
+        "prefix": [6,6,25,14,33],
+        "time": 20240101,
+        "agent_id": 0,
+        "holiday": 1,              
+        "time_zone": 0,            
+        "plaza_node_tokens": [14, 33]
+    },
+    {
+        "name": "16,35,35,14,33",  # 卒論最終で使用2
+        "prefix": [16,35,35,14,33],
+        "time": 20240101,
+        "holiday": 1,              
+        "time_zone": 0,            
+        "agent_id": 0,
+        "plaza_node_tokens": [14, 33]
+    },
     # {
     #     "name": "0,1,2,21,21",
     #     "prefix": [0, 1, 2, 21, 21],  # 初期prefix
@@ -146,21 +165,10 @@ SCENARIOS = [
     # },
 ]
 
-# パス設定（環境に合わせて変更してください）
-MODEL_PATH = "/home/mizutani/projects/RF/runs/20260127_014201/model_weights_20260127_014201.pth"
-ADJ_PATH = "/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt"
-DATA_PATH = "/home/mizutani/projects/RF/data/input_real_m5.npz"
-
-# 出力先
-RUN_ID = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUT_DIR = os.path.join(os.path.dirname(MODEL_PATH), f"scen2_{RUN_ID}")
-os.makedirs(OUT_DIR, exist_ok=True)
-
-# デバイス
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# 解析パラメータ
-NUM_ROLLOUT_STEPS = 15  # 何ステップ生成するか
+# デフォルトパス（CLI 未指定時）
+DEFAULT_ADJ_PATH = "/mnt/okinawa/9月BLEデータ/route_input/network/adjacency_matrix.pt"
+DEFAULT_NUM_ROLLOUT_STEPS = 15
+CHECKPOINT_MANIFEST = "checkpoint.json"
 
 # モード分類しきい値（|λ| < thresh を短期減衰モードとみなす）
 EIG_ABS_SHORT_TERM_THRESH = 0.5
@@ -1113,75 +1121,333 @@ def visualize_koopman_biplot_grid(analyzer, step_data, scenario, tokenizer, out_
 
 
 # =========================================================
-#  Main Pipeline
+#  Model / Grid Helpers
 # =========================================================
 
-def main():
-    print("="*60)
-    print("Koopman Analysis Pipeline (Original Model)")
-    print("="*60)
-    
-    # データロード
-    print("\n1. Loading Data...")
-    adj_matrix = torch.load(ADJ_PATH, weights_only=True)
+def _parse_csv_strs(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def _parse_csv_ints(value: str | None) -> list[int]:
+    return [int(x) for x in _parse_csv_strs(value)]
+
+
+def resolve_model_path(train_out_dir: str | Path) -> str:
+    """train が書いた checkpoint.json を優先し、なければ最新 .pth にフォールバック。"""
+    train_out_dir = Path(train_out_dir)
+    manifest_path = train_out_dir / CHECKPOINT_MANIFEST
+    if manifest_path.exists():
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+        model_path = data.get("model_path")
+        if model_path and os.path.exists(model_path):
+            return model_path
+        raise FileNotFoundError(
+            f"checkpoint.json に記載の model_path が存在しません: {model_path}"
+        )
+
+    cands = sorted(train_out_dir.glob("*.pth"), key=lambda p: p.stat().st_mtime)
+    if not cands:
+        raise FileNotFoundError(f"No .pth found in {train_out_dir}")
+    return str(cands[-1])
+
+
+def default_out_dir(model_path: str | Path) -> str:
+    p = Path(model_path)
+    if p.parent.name == "train":
+        return str(p.parent.parent / "scen2")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return str(p.parent / f"scen2_{ts}")
+
+
+def load_model(model_path: str | Path, device: torch.device, base_N: int) -> tuple[KoopmanRoutesFormer, dict]:
+    """チェックポイントから KoopmanRoutesFormer を復元（encoder_type / max_prefix_len 対応）。"""
+    ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    state_dict = ckpt["model_state_dict"]
+    c = ckpt.get("config", {})
+    h = _infer_model_hparams(c, state_dict, base_N)
+
+    max_prefix_len = int(
+        c.get("max_prefix_len", c.get("fixed_prefix_length", len(SCENARIOS[0]["prefix"])))
+    )
+    encoder_type = str(c.get("encoder_type", "transformer"))
+    use_aux_loss = bool(c.get("use_aux_loss", False))
+
+    model = KoopmanRoutesFormer(
+        vocab_size=h["vocab_size"],
+        token_emb_dim=h["token_emb_dim"],
+        d_model=h["d_model"],
+        nhead=h["nhead"],
+        num_layers=h["num_layers"],
+        d_ff=h["d_ff"],
+        z_dim=h["z_dim"],
+        pad_token_id=h["pad_token_id"],
+        base_N=h["base_N"],
+        num_agents=h["num_agents"],
+        agent_emb_dim=h["agent_emb_dim"],
+        max_stay_count=h["max_stay_count"],
+        stay_emb_dim=h["stay_emb_dim"],
+        holiday_emb_dim=h["holiday_emb_dim"],
+        time_zone_emb_dim=h["time_zone_emb_dim"],
+        event_emb_dim=h["event_emb_dim"],
+        use_aux_loss=use_aux_loss,
+        encoder_type=encoder_type,
+        max_prefix_len=max_prefix_len,
+    ).to(device)
+    print(
+        "Resolved model config: "
+        f"z_dim={h['z_dim']}, d_model={h['d_model']}, num_layers={h['num_layers']}, "
+        f"nhead={h['nhead']}, encoder_type={encoder_type}, max_prefix_len={max_prefix_len}"
+    )
+
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+    return model, h
+
+
+def setup_network(adj_path: str | Path):
+    adj_matrix = torch.load(adj_path, weights_only=True)
     if adj_matrix.shape[0] == 38:
         base_N = 19
     else:
         base_N = int(adj_matrix.shape[0])
-    
+
     expanded_adj = expand_adjacency_matrix(adj_matrix)
     dummy_feat = torch.zeros((len(adj_matrix), 1))
     node_features = torch.cat([dummy_feat, dummy_feat], dim=0)
     network = Network(expanded_adj, node_features)
     tokenizer = Tokenization(network)
-    
-    # モデルロード
-    print(f"\n2. Loading Model: {MODEL_PATH}")
-    ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
-    state_dict = ckpt['model_state_dict']
-    c = ckpt.get('config', {})
-    h = _infer_model_hparams(c, state_dict, base_N)
-    
-    # モデル初期化　モデル初期化を h[...] ベースに．z_dim=c.get('z_dim', 16) 依存を排除．
-    model = KoopmanRoutesFormer(
-        vocab_size=h['vocab_size'],
-        token_emb_dim=h['token_emb_dim'],
-        d_model=h['d_model'],
-        nhead=h['nhead'],
-        num_layers=h['num_layers'],
-        d_ff=h['d_ff'],
-        z_dim=h['z_dim'],
-        pad_token_id=h['pad_token_id'],
-        base_N=h['base_N'],
-        num_agents=h['num_agents'],
-        agent_emb_dim=h['agent_emb_dim'],
-        max_stay_count=h['max_stay_count'],
-        stay_emb_dim=h['stay_emb_dim'],
-        holiday_emb_dim=h['holiday_emb_dim'],
-        time_zone_emb_dim=h['time_zone_emb_dim'],
-        event_emb_dim=h['event_emb_dim'],
-    ).to(DEVICE)
-    print(f"Resolved model config: z_dim={h['z_dim']}, d_model={h['d_model']}, num_layers={h['num_layers']}, nhead={h['nhead']}")
-    
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    
-    # 解析準備
+    return network, tokenizer, expanded_adj, base_N
+
+
+def iter_grid_experiments(
+    session_root: str | Path,
+    grid_types: list[str] | None = None,
+    model_types: list[str] | None = None,
+    z_dims: list[int] | None = None,
+):
+    """run_experiment_grid.py の session 配下から scen2 対象実験を列挙する。"""
+    session_root = Path(session_root)
+    if not session_root.exists():
+        raise FileNotFoundError(f"session root が存在しません: {session_root}")
+
+    for exp_dir in sorted(session_root.iterdir()):
+        if not exp_dir.is_dir():
+            continue
+
+        manifest_path = exp_dir / "experiment.json"
+        if manifest_path.exists():
+            with open(manifest_path, encoding="utf-8") as f:
+                manifest = json.load(f)
+            hp = manifest.get("hyperparams", {})
+            model_path = manifest.get("model_path")
+            grid_types_in = manifest.get("grid_types", [])
+            model_type = hp.get("model_type")
+            z_dim = hp.get("z_dim")
+        else:
+            train_dir = exp_dir / "train"
+            if not train_dir.exists():
+                continue
+            model_path = resolve_model_path(train_dir)
+            grid_types_in = []
+            model_type = None
+            z_dim = None
+            manifest = {"experiment": exp_dir.name}
+
+        if not model_path or not os.path.exists(model_path):
+            print(f"[SKIP] model_path なし: {exp_dir.name}")
+            continue
+
+        if grid_types and not any(gt in grid_types for gt in grid_types_in):
+            # experiment.json が無い古い run は grid_type フィルタをスキップ
+            if grid_types_in:
+                continue
+
+        if model_types and model_type is not None and model_type not in model_types:
+            continue
+        if z_dims and z_dim is not None and int(z_dim) not in z_dims:
+            continue
+
+        yield {
+            "exp_dir": exp_dir,
+            "experiment": manifest.get("experiment", exp_dir.name),
+            "model_path": model_path,
+            "model_type": model_type,
+            "z_dim": z_dim,
+            "grid_types": grid_types_in,
+        }
+
+
+def run_analysis(
+    model_path: str | Path,
+    out_dir: str | Path,
+    adj_path: str | Path,
+    num_rollout_steps: int,
+    device: torch.device,
+    scenarios: list[dict] | None = None,
+) -> str:
+    """1モデル分の scen2 解析を実行する。"""
+    model_path = str(model_path)
+    out_dir = str(out_dir)
+    scenarios = scenarios or SCENARIOS
+
+    print("=" * 60)
+    print("Koopman Analysis Pipeline (Original Model)")
+    print(f"Model: {model_path}")
+    print(f"Output: {out_dir}")
+    print("=" * 60)
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    print("\n1. Loading Data...")
+    network, tokenizer, expanded_adj, base_N = setup_network(adj_path)
+
+    print(f"\n2. Loading Model: {model_path}")
+    model, _ = load_model(model_path, device, base_N)
+
     analyzer = KoopmanEigenAnalyzer(model)
-    analyzer.plot_eigenvalues(os.path.join(OUT_DIR, "eigenvalues.png"))
-    
-    # シナリオ実行
+    analyzer.plot_eigenvalues(os.path.join(out_dir, "eigenvalues.png"))
+
     print("\n3. Running Scenarios...")
-    for scenario in SCENARIOS:
+    for scenario in scenarios:
         greedy_rollout_with_analysis(
             model, analyzer, tokenizer, network, expanded_adj,
-            scenario, NUM_ROLLOUT_STEPS, DEVICE, OUT_DIR
+            scenario, num_rollout_steps, device, out_dir
         )
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("All done.")
-    print(f"Output: {OUT_DIR}")
-    print("="*60)
+    print(f"Output: {out_dir}")
+    print("=" * 60)
+    return out_dir
+
+
+# =========================================================
+#  Main Pipeline
+# =========================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Koopman scen2 解析（単体モデル or run_experiment_grid セッション一括）"
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="単体実行時の学習済み .pth パス",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default=None,
+        help="出力先（未指定時: exp_dir/scen2 または model 隣の scen2_*）",
+    )
+    parser.add_argument(
+        "--session-root",
+        type=str,
+        default=None,
+        help="run_experiment_grid.py の1セッション出力ディレクトリ（一括実行）",
+    )
+    parser.add_argument(
+        "--grid-type",
+        type=str,
+        default=None,
+        help="フィルタ: カンマ区切り (例: model_x_zdim,model_x_prefix)",
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        default=None,
+        help="フィルタ: カンマ区切り (例: transformer,lstm,mlp_flat)",
+    )
+    parser.add_argument(
+        "--z-dims",
+        type=str,
+        default=None,
+        help="フィルタ: カンマ区切り z_dim (例: 16,32,64,128)",
+    )
+    parser.add_argument(
+        "--adj-path",
+        type=str,
+        default=DEFAULT_ADJ_PATH,
+        help="隣接行列 .pt のパス",
+    )
+    parser.add_argument(
+        "--num-rollout-steps",
+        type=int,
+        default=DEFAULT_NUM_ROLLOUT_STEPS,
+        help="Greedy ロールアウトステップ数",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="一括実行で1件でも失敗したら即停止",
+    )
+    args = parser.parse_args()
+
+    if not args.model_path and not args.session_root:
+        parser.error("--model-path または --session-root のいずれかを指定してください")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    grid_types = _parse_csv_strs(args.grid_type)
+    model_types = _parse_csv_strs(args.model_type)
+    z_dims = _parse_csv_ints(args.z_dims)
+
+    if args.session_root:
+        success = 0
+        skipped = 0
+        targets = list(
+            iter_grid_experiments(
+                session_root=args.session_root,
+                grid_types=grid_types or None,
+                model_types=model_types or None,
+                z_dims=z_dims or None,
+            )
+        )
+        if not targets:
+            raise RuntimeError(f"対象実験が見つかりません: {args.session_root}")
+
+        print(f"[INFO] session_root: {args.session_root}")
+        print(f"[INFO] targets: {len(targets)}")
+
+        for item in targets:
+            exp_name = item["experiment"]
+            model_path = item["model_path"]
+            out_dir = args.out_dir or str(item["exp_dir"] / "scen2")
+            print(f"\n[RUN] {exp_name}")
+            print(f"      model_path={model_path}")
+            print(f"      out_dir={out_dir}")
+            try:
+                run_analysis(
+                    model_path=model_path,
+                    out_dir=out_dir,
+                    adj_path=args.adj_path,
+                    num_rollout_steps=args.num_rollout_steps,
+                    device=device,
+                )
+                success += 1
+            except Exception as e:
+                msg = f"[FAIL] {exp_name}: {e}"
+                if args.strict:
+                    raise RuntimeError(msg) from e
+                print(msg)
+                skipped += 1
+
+        print(f"\n完了: success={success}, skipped_or_failed={skipped}")
+        return
+
+    model_path = args.model_path
+    out_dir = args.out_dir or default_out_dir(model_path)
+    run_analysis(
+        model_path=model_path,
+        out_dir=out_dir,
+        adj_path=args.adj_path,
+        num_rollout_steps=args.num_rollout_steps,
+        device=device,
+    )
+
 
 if __name__ == "__main__":
     main()
