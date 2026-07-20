@@ -723,12 +723,12 @@ for epoch in range(wandb.config.epochs):
             prefix_times=times,
         )
         
-        pred_logits = outputs['pred_logits']  # [B, K, vocab]
+        pred_logits = outputs['pred_logits']  # [B(バッチサイズ), K(予測ステップ数), vocab_size]
         
         # CE損失（パディング除外）
         valid_mask = ~future_mask[:, :K]
         ce_loss = nn.functional.cross_entropy(
-            pred_logits.reshape(-1, vocab_size),
+            pred_logits.reshape(-1, vocab_size), # [B*K, vocab_size] にする．B*K個の予測結果のce誤差を計算する．
             future_tokens[:, :K].reshape(-1),
             weight=ce_class_weight,
             reduction='none'
