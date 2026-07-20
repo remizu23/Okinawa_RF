@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import subprocess
 from collections import defaultdict
@@ -6,6 +7,8 @@ from glob import glob
 from datetime import datetime
 
 import pandas as pd
+
+CHECKPOINT_MANIFEST = "checkpoint.json"
 
 
 def run_cmd(cmd):
@@ -18,6 +21,22 @@ def latest_pth(train_out_dir):
     if not cands:
         raise FileNotFoundError(f"No .pth found in {train_out_dir}")
     return cands[-1]
+
+
+def resolve_model_path(train_out_dir):
+    """train が書いた checkpoint.json を優先し、なければ最新 .pth にフォールバック。"""
+    manifest_path = os.path.join(train_out_dir, CHECKPOINT_MANIFEST)
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as f:
+            data = json.load(f)
+        model_path = data.get("model_path")
+        if model_path and os.path.exists(model_path):
+            return model_path
+        raise FileNotFoundError(
+            f"checkpoint.json に記載の model_path が存在しません: {model_path}"
+        )
+    print(f"[WARN] {CHECKPOINT_MANIFEST} が見つかりません。最新 .pth にフォールバックします。")
+    return latest_pth(train_out_dir)
 
 
 def summarize_eval(eval_out_dir, prefix_len, meta):
@@ -43,11 +62,11 @@ def main():
     # 引数定義（実験条件）
     p = argparse.ArgumentParser(description="Run grid experiments for DKP_RF")
     p.add_argument("--mode", choices=["prefix", "zdim", "both"], default="both")
-    p.add_argument("--model-types", type=str, default="transformer,mlp_flat")
+    p.add_argument("--model-types", type=str, default="transformer,mlp_flat,lstm")
     # p.add_argument("--prefix-lengths", type=str, default="2,3,4,5")
     p.add_argument("--prefix-lengths", type=str, default="5")
     # p.add_argument("--z-dims", type=str, default="8,16,32,64")
-    p.add_argument("--z-dims", type=str, default="128")
+    p.add_argument("--z-dims", type=str, default="16,32,64,128")
     p.add_argument("--fixed-prefix-for-zdim", type=int, default=5)  # prefix長を変える実験（model_x_prefix）で使う固定 z_dim
     p.add_argument("--fixed-zdim-for-prefix", type=int, default=16)  # z_dimを変える実験（model_x_zdim）で使う固定 prefix_len
     p.add_argument("--epochs", type=int, default=150)
@@ -151,7 +170,7 @@ def main():
         if args.deterministic_cuda:
             train_cmd.append("--deterministic-cuda")
         run_cmd(train_cmd)
-        model_path = latest_pth(train_out)
+        model_path = resolve_model_path(train_out)
 
         # eval
         inf_cmd = [
@@ -163,6 +182,32 @@ def main():
             "--prefix-lengths", str(exp["prefix_len"]),
         ]
         run_cmd(inf_cmd)
+
+        experiment_manifest = {
+            "experiment": exp_name,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "session_root": session_root,
+            "train_out_dir": train_out,
+            "eval_out_dir": eval_out,
+            "model_path": model_path,
+            "grid_types": grid_types,
+            "hyperparams": {
+                "model_type": exp["model_type"],
+                "prefix_len": exp["prefix_len"],
+                "z_dim": exp["z_dim"],
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "learning_rate": args.learning_rate,
+                "seed": args.seed,
+                "deterministic_cuda": args.deterministic_cuda,
+                "eval_data": args.eval_data,
+                "ablation_model_path": args.ablation_model_path,
+            },
+            "train_cmd": train_cmd,
+            "inf_cmd": inf_cmd,
+        }
+        with open(os.path.join(exp_root, "experiment.json"), "w", encoding="utf-8") as f:
+            json.dump(experiment_manifest, f, indent=2, ensure_ascii=False)
 
         # 結果の要約（dedupe 時は grid_type ごとに同一指標の行を出す）
         for grid_type in grid_types:

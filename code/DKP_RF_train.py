@@ -1,5 +1,6 @@
 from seaborn.matrix import dendrogram
 import argparse
+import json
 import torch
 import torch.nn as nn
 import numpy as np
@@ -176,8 +177,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # --- 保存ディレクトリ ---
+# cliで渡された --out-dir で保存先を決める．未指定時は従来どおり．
 run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-out_dir = f"/home/mizutani/projects/RF/runs/{run_id}"
+if cli_args.out_dir:
+    out_dir = os.path.abspath(cli_args.out_dir)
+else:
+    out_dir = f"/home/mizutani/projects/RF/runs/{run_id}"
 os.makedirs(out_dir, exist_ok=True)
 def stamp(name): return os.path.join(out_dir, name)
 
@@ -948,6 +953,21 @@ save_data = {
 
 torch.save(save_data, savefilename)
 print(f"Model saved to: {savefilename}")
+
+# 学習完了後、train/ 配下に manifest を保存
+manifest_path = os.path.join(out_dir, "checkpoint.json")
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(
+        {
+            "model_path": savefilename,
+            "run_id": run_id,
+            "out_dir": out_dir,
+        },
+        f,
+        indent=2,
+        ensure_ascii=False,
+    )
+print(f"Checkpoint manifest saved to: {manifest_path}")
 
 # ========================================
 # 4-2. グラフ描画
