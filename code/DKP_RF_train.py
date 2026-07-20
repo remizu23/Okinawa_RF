@@ -1,7 +1,9 @@
 from seaborn.matrix import dendrogram
+import argparse
 import torch
 import torch.nn as nn
 import numpy as np
+import random
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 import wandb
@@ -28,6 +30,7 @@ wandb.config = type("C", (), {
     "d_ff": 128, 
     "B_de": 3,
     "z_dim": 16,
+    "encoder_type": "transformer",
     "agent_emb_dim": 16,
     "stay_emb_dim": 16,
     "max_stay_count": 500,
@@ -65,7 +68,77 @@ wandb.config = type("C", (), {
     
     # ★ 分割インデックス保存
     "save_split_indices": True,
+
+    # ★ 再現性設定
+    "seed": 42,
+    "deterministic_cuda": False, # CUDA由来の揺らぎ：Trueにすると遅くなるがランダム性なくなる．
 })()
+
+# =======================================================
+# 1-1.2 CLI引数（grid実験用の上書き）
+# =======================================================
+parser = argparse.ArgumentParser(description="DKP_RF training (config overrides)")
+parser.add_argument("--out-dir", type=str, default=None)
+parser.add_argument("--epochs", type=int, default=None)
+parser.add_argument("--batch-size", type=int, default=None)
+parser.add_argument("--learning-rate", type=float, default=None)
+parser.add_argument("--z-dim", type=int, default=None)
+parser.add_argument("--fixed-prefix-length", type=int, default=None)
+parser.add_argument("--encoder-type", type=str, default=None, choices=["transformer", "lstm", "mlp_flat"])
+parser.add_argument("--seed", type=int, default=None)
+parser.add_argument("--deterministic-cuda", action="store_true")
+cli_args, _unknown = parser.parse_known_args()
+
+if cli_args.epochs is not None:
+    wandb.config.epochs = int(cli_args.epochs)
+if cli_args.batch_size is not None:
+    wandb.config.batch_size = int(cli_args.batch_size)
+if cli_args.learning_rate is not None:
+    wandb.config.learning_rate = float(cli_args.learning_rate)
+if cli_args.z_dim is not None:
+    wandb.config.z_dim = int(cli_args.z_dim)
+if cli_args.fixed_prefix_length is not None:
+    wandb.config.fixed_prefix_length = int(cli_args.fixed_prefix_length)
+if cli_args.encoder_type is not None:
+    wandb.config.encoder_type = str(cli_args.encoder_type)
+if cli_args.seed is not None:
+    wandb.config.seed = int(cli_args.seed)
+if bool(cli_args.deterministic_cuda):
+    wandb.config.deterministic_cuda = True
+
+# =======================================================
+# 1-1.5 乱数シード固定（再現性）
+# =======================================================
+def seed_everything(seed: int, deterministic_cuda: bool = True):
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic_cuda:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+
+
+def seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % (2**32)
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+seed_everything(wandb.config.seed, wandb.config.deterministic_cuda)
+print(f"[Seed] seed={wandb.config.seed}, deterministic_cuda={wandb.config.deterministic_cuda}")
 
 # =======================================================
 # 1-2. データの読み込み【シナリオに応じて要変更②】・ネットワーク作成
@@ -504,8 +577,12 @@ print(f"Test samples: {len(test_dataset)}")
 # =====================================================
 # 2-5. データセットから，DataLoaderを作成
 # =====================================================
+loader_generator = torch.Generator()
+loader_generator.manual_seed(int(wandb.config.seed))
+
 train_loader = DataLoader(train_dataset, batch_size=wandb.config.batch_size, shuffle=True, 
-                          collate_fn=collate_variable_prefix, drop_last=True)
+                          collate_fn=collate_variable_prefix, drop_last=True,
+                          generator=loader_generator, worker_init_fn=seed_worker)
 val_loader = DataLoader(val_dataset, batch_size=wandb.config.batch_size, shuffle=False, 
                         collate_fn=collate_variable_prefix, drop_last=True)
 
@@ -521,6 +598,16 @@ num_agents = int(agent_pt.max().item()) + 1
 
 # ★ 補助損失を使うかどうか
 use_aux_loss = (wandb.config.aux_count_weight > 0 or wandb.config.aux_mode_weight > 0)
+
+# ★ max_prefix_len は `mlp_flat_proj` の入力次元を決めるため、
+# 推論側（DKP_RF_inf.py）と一致させる必要があります。
+# 今回は固定長prefix実験では fixed_prefix_length に合わせます。
+if wandb.config.use_variable_prefix:
+    max_prefix_len = int(max(wandb.config.prefix_lengths))
+else:
+    max_prefix_len = int(wandb.config.fixed_prefix_length)
+
+print(f"[Model] encoder_type={wandb.config.encoder_type}, max_prefix_len={max_prefix_len}")
 
 model = KoopmanRoutesFormer(
     vocab_size=vocab_size,
@@ -541,6 +628,9 @@ model = KoopmanRoutesFormer(
     time_zone_emb_dim=wandb.config.time_zone_emb_dim,
     event_emb_dim=wandb.config.event_emb_dim,
     use_aux_loss=use_aux_loss,
+    encoder_type=wandb.config.encoder_type,
+    max_prefix_len=max_prefix_len,
+
 ).to(device)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -843,7 +933,9 @@ save_data = {
         "prefix_lengths": wandb.config.prefix_lengths,
         "end_weight": float(END_WEIGHT),
         "min_future_length":wandb.config.min_future_length,
-        "fixed_prefix_length":wandb.config.fixed_prefix_length
+        "fixed_prefix_length":wandb.config.fixed_prefix_length,
+        "max_prefix_len": int(max_prefix_len),
+        "encoder_type": str(wandb.config.encoder_type),
     },
     "history": history,
     "split_sequences": {

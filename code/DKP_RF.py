@@ -65,6 +65,8 @@ class KoopmanRoutesFormer(nn.Module):
         time_zone_emb_dim=4,
         event_emb_dim=4,
         use_aux_loss=False,  # 補助損失を使うかどうか
+        encoder_type: str = "transformer",
+        max_prefix_len: int = 8,
     ):
         super().__init__()
         
@@ -81,15 +83,24 @@ class KoopmanRoutesFormer(nn.Module):
         
         self.pos_encoder = PositionalEncoding(d_model)
         self.input_proj = nn.Linear(total_input_dim, d_model)
+        self.encoder_type = str(encoder_type).lower()
+        self.max_prefix_len = int(max_prefix_len)
 
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_ff, 
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_ff,
             batch_first=True
         )
         self.transformer_block = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
+        self.lstm_encoder = nn.LSTM(
+            input_size=d_model,
+            hidden_size=d_model,
+            num_layers=max(1, int(num_layers)),
+            batch_first=True,
+            dropout=0.0 if int(num_layers) <= 1 else 0.1,
+        )
+        self.mlp_flat_proj = nn.Linear(d_model * self.max_prefix_len, z_dim)
         self.to_z = nn.Linear(d_model, z_dim)
         self.to_logits = nn.Linear(z_dim, vocab_size) 
 
@@ -99,6 +110,8 @@ class KoopmanRoutesFormer(nn.Module):
         self.z_dim = z_dim
         self.max_stay_count = max_stay_count
         self.use_aux_loss = use_aux_loss
+        if self.encoder_type not in {"transformer", "lstm", "mlp_flat"}:
+            raise ValueError(f"Unsupported encoder_type: {self.encoder_type}")
 
         # Koopman Dynamics (B行列は削除)
         self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
@@ -177,33 +190,47 @@ class KoopmanRoutesFormer(nn.Module):
             holiday_vec, timezone_vec, event_vec
         ], dim=-1)        
 
-        x = self.input_proj(u_all)
-        x = self.pos_encoder(x)
-        
-        # Causal mask と padding mask
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
-        
+        x = self.input_proj(u_all)  # [B, Lp, d_model]
+
         if prefix_mask is None:
             pad_mask = (prefix_tokens == self.pad_token_id).to(x.device)
         else:
             pad_mask = prefix_mask.to(x.device)
-        
-        h = self.transformer_block(
-            src=x, 
-            mask=causal_mask, 
-            src_key_padding_mask=pad_mask
-        )  # [B, Lp, d_model]
-        
-        # 最後の有効位置を取得
-        # pad_mask が True の位置は無効
+
         valid_lengths = (~pad_mask).sum(dim=1)  # [B]
         last_indices = (valid_lengths - 1).clamp(min=0)  # [B]
-        
-        # 各バッチの最後の有効位置の hidden state を取得
-        h_last = h[torch.arange(batch_size), last_indices, :]  # [B, d_model]
-        
-        # z_0 に投影
-        z_0 = self.to_z(h_last)  # [B, z_dim]
+
+        if self.encoder_type == "transformer":
+            x_enc = self.pos_encoder(x)
+            causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(x.device)
+            h = self.transformer_block(
+                src=x_enc,
+                mask=causal_mask,
+                src_key_padding_mask=pad_mask
+            )  # [B, Lp, d_model]
+            h_last = h[torch.arange(batch_size), last_indices, :]  # [B, d_model]
+            z_0 = self.to_z(h_last)  # [B, z_dim]
+
+        elif self.encoder_type == "lstm":
+            x_masked = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+            h_seq, _ = self.lstm_encoder(x_masked)  # [B, Lp, d_model]
+            h_last = h_seq[torch.arange(batch_size), last_indices, :]
+            z_0 = self.to_z(h_last)
+
+        else:  # mlp_flat
+            # 順序を強制しない単純flatten: [B, Lp, d_model] -> [B, max_prefix_len*d_model]
+            x_masked = x.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+            if seq_len >= self.max_prefix_len:
+                x_fixed = x_masked[:, :self.max_prefix_len, :]
+            else:
+                pad_len = self.max_prefix_len - seq_len
+                x_fixed = F.pad(x_masked, (0, 0, 0, pad_len), mode="constant", value=0.0)
+            flat = x_fixed.reshape(batch_size, self.max_prefix_len * x_fixed.size(-1))
+            z_0 = self.mlp_flat_proj(flat)
+
+            # 補助用途に使える代表ベクトル（学習損失の主対象ではない）
+            denom = valid_lengths.clamp(min=1).unsqueeze(-1).to(x.dtype)
+            h_last = x_masked.sum(dim=1) / denom
         
         return z_0, h_last
 

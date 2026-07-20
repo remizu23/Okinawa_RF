@@ -107,7 +107,8 @@ def get_movable_tokens(current_node, adj_matrix, pad_token_id=38, end_token_id=3
         stay_token = current_node + 19
         movable_tokens.append(stay_token)
     
-    movable_tokens.append(end_token_id)
+    # movable_tokens.append(end_token_id)
+    movable_tokens.append(pad_token_id)  # 今回，元RoutesFormerのtokeniationは使っていないので，paddingがendを意味する．
     return sorted(movable_tokens)
 
 

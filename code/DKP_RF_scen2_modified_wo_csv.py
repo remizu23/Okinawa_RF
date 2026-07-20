@@ -46,50 +46,50 @@ SCENARIOS = [
         "plaza_node_tokens": [2, 21],  # 広場として扱うノード
     },
     {
-        "name": "11,30,8,8,9",
-        "prefix": [11,30,8,8,9],  # 初期prefix
+        "name": "0,1,2,21,21",
+        "prefix": [0,1,2,21,21],  # 初期prefix
         "time": 20240101,
         "agent_id": 0,
         "holiday": 1,
         "time_zone": 0,
-        "plaza_node_tokens": [11, 30],  # 広場として扱うノード
+        "plaza_node_tokens": [2, 21],  # 広場として扱うノード
     },
     {
-        "name": "4,4,23,23,11",
-        "prefix": [4,4,23,23,11],  # 初期prefix
+        "name": "12,10,5,2,21",
+        "prefix": [12,10,5,2,21],  # 初期prefix
         "time": 20240101,
         "agent_id": 0,
         "holiday": 1,
         "time_zone": 0,
-        "plaza_node_tokens": [11, 30],  # 広場として扱うノード
+        "plaza_node_tokens": [2, 21],  # 広場として扱うノード
     },
     {
-        "name": "6,6,25,14,33",
-        "prefix": [6,6,25,14,33],
+        "name": "16,14,6,2,21",
+        "prefix": [16,14,6,2,21],
         "time": 20240101,
         "agent_id": 0,
         "holiday": 1,
         "time_zone": 0,
-        "plaza_node_tokens": [14, 33],
+        "plaza_node_tokens": [2, 21],
     },
-    {
-        "name": "6,6,25,14,33",
-        "prefix": [6,6,25,14,33],
-        "time": 20240101,
-        "agent_id": 0,
-        "holiday": 1,              
-        "time_zone": 0,            
-        "plaza_node_tokens": [14, 33]
-    },
-    {
-        "name": "16,35,35,14,33",
-        "prefix": [16,35,35,14,33],
-        "time": 20240101,
-        "holiday": 1,              
-        "time_zone": 0,            
-        "agent_id": 0,
-        "plaza_node_tokens": [14, 33]
-    },
+    # {
+    #     "name": "6,6,25,14,33",
+    #     "prefix": [6,6,25,14,33],
+    #     "time": 20240101,
+    #     "agent_id": 0,
+    #     "holiday": 1,              
+    #     "time_zone": 0,            
+    #     "plaza_node_tokens": [14, 33]
+    # },
+    # {
+    #     "name": "16,35,35,14,33",
+    #     "prefix": [16,35,35,14,33],
+    #     "time": 20240101,
+    #     "holiday": 1,              
+    #     "time_zone": 0,            
+    #     "agent_id": 0,
+    #     "plaza_node_tokens": [14, 33]
+    # },
     # {
     #     "name": "0,1,2,21,21",
     #     "prefix": [0, 1, 2, 21, 21],  # 初期prefix
@@ -163,14 +163,14 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_ROLLOUT_STEPS = 15  # 何ステップ生成するか
 
 # モード分類しきい値（|λ| < thresh を短期減衰モードとみなす）
-EIG_ABS_SHORT_TERM_THRESH = 0.7
+EIG_ABS_SHORT_TERM_THRESH = 0.5
 
 
 # =========================================================
 #  Utility Functions
 # =========================================================
 
-def get_movable_tokens(current_node, adj_matrix, pad_token_id=38, end_token_id=39):
+def get_movable_tokens(current_node, adj_matrix, pad_token_id=38, end_token_id=38):
     """現在位置から移動可能なトークンを取得"""
     if isinstance(adj_matrix, torch.Tensor):
         adj_np = adj_matrix.cpu().numpy()
@@ -217,6 +217,127 @@ def softmax_np(x):
     e = np.exp(x)
     s = e.sum()
     return e / s if s != 0 else np.full_like(e, 1.0 / len(e))
+
+
+def token_probs_to_move_stay_end_probs(
+    token_probs_1d: np.ndarray,
+    *,
+    num_nodes: int = 19,
+    stay_offset: int = 19,
+    end_token_id: int = 38,
+):
+    """token確率ベクトル（語彙次元）を、move/stay/ENDへ集約する。
+
+    - move token: [0..num_nodes-1] → MOVE i
+    - stay token: [stay_offset..stay_offset+num_nodes-1] → STAY i
+    - END: end_token_id → END
+
+    返り値は長さ (2*num_nodes + 1) の 1次元配列：
+    [move0..move18, stay0..stay18, END]
+    """
+    p = np.asarray(token_probs_1d).reshape(-1)
+    if p.shape[0] <= end_token_id:
+        raise ValueError(f"token_probs length {p.shape[0]} is smaller than end_token_id={end_token_id}")
+    if num_nodes <= 0:
+        raise ValueError(f"num_nodes must be positive, got {num_nodes}")
+    if stay_offset < 0:
+        raise ValueError(f"stay_offset must be >=0, got {stay_offset}")
+
+    move_stay_end_p = np.zeros((2 * num_nodes + 1,), dtype=float)
+
+    # move tokens: 0..(num_nodes-1)
+    if p.shape[0] < num_nodes:
+        raise ValueError(f"token_probs length {p.shape[0]} is smaller than num_nodes={num_nodes}")
+    move_stay_end_p[:num_nodes] += p[:num_nodes]
+
+    # stay tokens: stay_offset..(stay_offset+num_nodes-1) (if present)
+    stay_end = stay_offset + num_nodes
+    if p.shape[0] >= stay_end:
+        move_stay_end_p[num_nodes:2 * num_nodes] += p[stay_offset:stay_end]
+
+    # END
+    move_stay_end_p[2 * num_nodes] += p[end_token_id]
+
+    return move_stay_end_p
+
+
+def _write_node_prob_csv(node_by_time: np.ndarray, row_labels: list[str], out_path: str):
+    """node_by_time: shape=(num_rows, T), rows correspond to row_labels."""
+    node_by_time = np.asarray(node_by_time)
+    if node_by_time.ndim != 2:
+        raise ValueError(f"node_by_time must be 2D, got shape={node_by_time.shape}")
+    if node_by_time.shape[0] != len(row_labels):
+        raise ValueError(f"row_labels length mismatch: {len(row_labels)} vs {node_by_time.shape[0]}")
+
+    T = int(node_by_time.shape[1])
+    header = ["token"] + [f"t{t}" for t in range(1, T + 1)]
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        for i, label in enumerate(row_labels):
+            w.writerow([label] + [float(x) for x in node_by_time[i, :].tolist()])
+
+
+def _infer_model_hparams(ckpt_config, state_dict, base_N):
+    """ckpt config が欠けていても state_dict 形状から復元する。"""
+    c = ckpt_config if isinstance(ckpt_config, dict) else {}
+
+    def pick(*keys, default=None):
+        for k in keys:
+            if k in c:
+                return c[k]
+        return default
+
+    # state_dict から推定できる値
+    inferred_vocab_size = int(state_dict["token_embedding.weight"].shape[0])
+    inferred_token_emb_dim = int(state_dict["token_embedding.weight"].shape[1])
+    inferred_d_model = int(state_dict["input_proj.weight"].shape[0])
+    inferred_z_dim = int(state_dict["A"].shape[0])
+    inferred_num_agents = int(state_dict["agent_embedding.weight"].shape[0])
+    inferred_agent_emb_dim = int(state_dict["agent_embedding.weight"].shape[1])
+    inferred_max_stay_count = int(state_dict["stay_embedding.weight"].shape[0] - 1)
+    inferred_stay_emb_dim = int(state_dict["stay_embedding.weight"].shape[1])
+    inferred_holiday_emb_dim = int(state_dict["holiday_embedding.weight"].shape[1])
+    inferred_time_zone_emb_dim = int(state_dict["time_zone_embedding.weight"].shape[1])
+    inferred_event_emb_dim = int(state_dict["event_embedding.weight"].shape[1])
+    inferred_d_ff = int(state_dict["transformer_block.layers.0.linear1.weight"].shape[0])
+
+    # 層数は state_dict のキー数から推定
+    transformer_layer_ids = set()
+    for k in state_dict.keys():
+        if k.startswith("transformer_block.layers."):
+            parts = k.split(".")
+            if len(parts) > 3 and parts[3].isdigit():
+                transformer_layer_ids.add(int(parts[3]))
+    inferred_num_layers = (max(transformer_layer_ids) + 1) if transformer_layer_ids else 3
+
+    # nhead は通常 config に入っている想定。無い場合は安全な候補から推定
+    nhead_from_cfg = pick("nhead", "head_num", default=None)
+    if nhead_from_cfg is None:
+        for cand in (8, 4, 2, 1):
+            if inferred_d_model % cand == 0:
+                nhead_from_cfg = cand
+                break
+    resolved_nhead = int(nhead_from_cfg)
+
+    return {
+        "vocab_size": int(pick("vocab_size", default=inferred_vocab_size)),
+        "token_emb_dim": int(pick("token_emb_dim", "d_ie", default=inferred_token_emb_dim)),
+        "d_model": int(pick("d_model", "d_ie", default=inferred_d_model)),
+        "nhead": resolved_nhead,
+        "num_layers": int(pick("num_layers", "B_de", default=inferred_num_layers)),
+        "d_ff": int(pick("d_ff", default=inferred_d_ff)),
+        "z_dim": int(pick("z_dim", default=inferred_z_dim)),
+        "pad_token_id": int(pick("pad_token_id", default=38)),
+        "base_N": int(pick("base_N", default=base_N)),
+        "num_agents": int(pick("num_agents", default=inferred_num_agents)),
+        "agent_emb_dim": int(pick("agent_emb_dim", default=inferred_agent_emb_dim)),
+        "max_stay_count": int(pick("max_stay_count", default=inferred_max_stay_count)),
+        "stay_emb_dim": int(pick("stay_emb_dim", default=inferred_stay_emb_dim)),
+        "holiday_emb_dim": int(pick("holiday_emb_dim", default=inferred_holiday_emb_dim)),
+        "time_zone_emb_dim": int(pick("time_zone_emb_dim", default=inferred_time_zone_emb_dim)),
+        "event_emb_dim": int(pick("event_emb_dim", default=inferred_event_emb_dim)),
+    }
 
 
 # =========================================================
@@ -362,6 +483,11 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
     step_data_withpath = []
     step_data_wopath = []
 
+    # --- 全ノード確率（node0..18 + END）を step ごとに保存 ---
+    node_probs_with_steps = []
+    node_probs_without_steps = []
+    node_probs_diff_steps = []
+
     ended_with = False
     ended_wo = False
 
@@ -383,6 +509,17 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
 
         probs_with = softmax_np(logits_with)
         probs_without = softmax_np(logits_without)
+
+        # --- move/stay/ENDへ集約（ENDは padding token <p>=38 として扱う） ---
+        node_p_with = token_probs_to_move_stay_end_probs(
+            probs_with, num_nodes=19, stay_offset=19, end_token_id=38
+        )
+        node_p_wo = token_probs_to_move_stay_end_probs(
+            probs_without, num_nodes=19, stay_offset=19, end_token_id=38
+        )
+        node_probs_with_steps.append(node_p_with)
+        node_probs_without_steps.append(node_p_wo)
+        node_probs_diff_steps.append(node_p_with - node_p_wo)
 
         # ==========================
         # 1) with 経路での比較
@@ -478,9 +615,7 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
         z_with = z_next_with
         z_without = z_next_without
 
-        if ended_with and ended_wo:
-            print("  Both paths ended, stopping.")
-            break
+        # NOTE: END が選ばれた後も「生のモデル確率」を見たいので、ここでは break しない。
 
     # --- 図出力 ---
     if len(step_data_withpath) > 0:
@@ -493,6 +628,29 @@ def greedy_rollout_with_analysis(model, analyzer, tokenizer, network, adj_matrix
 
     print(f"\nGenerated sequence (with plaza): {prefix} -> {generated_with}")
     print(f"Generated sequence (w/o plaza):  {prefix} -> {generated_without}")
+
+    # --- CSV出力（縦=move/stay/END, 横=時間） ---
+    if len(node_probs_with_steps) > 0:
+        node_labels = (
+            [f"move{i}" for i in range(19)]
+            + [f"stay{i}" for i in range(19)]
+            + ["END(pad_token=38)"]
+        )
+        mat_with = np.asarray(node_probs_with_steps, dtype=float).T  # (39, T)
+        mat_wo = np.asarray(node_probs_without_steps, dtype=float).T  # (39, T)
+        mat_diff = np.asarray(node_probs_diff_steps, dtype=float).T  # (39, T)
+
+        csv_with = os.path.join(out_dir, f"{scenario['name']}_move_stay_prob_with.csv")
+        csv_wo = os.path.join(out_dir, f"{scenario['name']}_move_stay_prob_without.csv")
+        csv_diff = os.path.join(out_dir, f"{scenario['name']}_move_stay_prob_diff_withminuswithout.csv")
+
+        _write_node_prob_csv(mat_with, node_labels, csv_with)
+        _write_node_prob_csv(mat_wo, node_labels, csv_wo)
+        _write_node_prob_csv(mat_diff, node_labels, csv_diff)
+
+        print(f"Saved move/stay prob CSV (with): {csv_with}")
+        print(f"Saved move/stay prob CSV (without): {csv_wo}")
+        print(f"Saved move/stay prob CSV (diff): {csv_diff}")
 
 
 
@@ -982,26 +1140,28 @@ def main():
     ckpt = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
     state_dict = ckpt['model_state_dict']
     c = ckpt.get('config', {})
+    h = _infer_model_hparams(c, state_dict, base_N)
     
-    # モデル初期化
+    # モデル初期化　モデル初期化を h[...] ベースに．z_dim=c.get('z_dim', 16) 依存を排除．
     model = KoopmanRoutesFormer(
-        vocab_size=c.get('vocab_size', 42),
-        token_emb_dim=c.get('token_emb_dim', 64),
-        d_model=c.get('d_model', 64),
-        nhead=c.get('nhead', 4),
-        num_layers=c.get('num_layers', 3),
-        d_ff=c.get('d_ff', 128),
-        z_dim=c.get('z_dim', 16),
-        pad_token_id=38,
-        base_N=base_N,
-        num_agents=c.get('num_agents', 1),
-        agent_emb_dim=c.get('agent_emb_dim', 16),
-        max_stay_count=c.get('max_stay_count', 500),
-        stay_emb_dim=c.get('stay_emb_dim', 16),
-        holiday_emb_dim=c.get('holiday_emb_dim', 4),
-        time_zone_emb_dim=c.get('time_zone_emb_dim', 4),
-        event_emb_dim=c.get('event_emb_dim', 4),
+        vocab_size=h['vocab_size'],
+        token_emb_dim=h['token_emb_dim'],
+        d_model=h['d_model'],
+        nhead=h['nhead'],
+        num_layers=h['num_layers'],
+        d_ff=h['d_ff'],
+        z_dim=h['z_dim'],
+        pad_token_id=h['pad_token_id'],
+        base_N=h['base_N'],
+        num_agents=h['num_agents'],
+        agent_emb_dim=h['agent_emb_dim'],
+        max_stay_count=h['max_stay_count'],
+        stay_emb_dim=h['stay_emb_dim'],
+        holiday_emb_dim=h['holiday_emb_dim'],
+        time_zone_emb_dim=h['time_zone_emb_dim'],
+        event_emb_dim=h['event_emb_dim'],
     ).to(DEVICE)
+    print(f"Resolved model config: z_dim={h['z_dim']}, d_model={h['d_model']}, num_layers={h['num_layers']}, nhead={h['nhead']}")
     
     model.load_state_dict(state_dict, strict=False)
     model.eval()

@@ -16,6 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
+import argparse
 import networkx as nx
 import os
 import sys  # 追加: 出力保存用
@@ -78,7 +79,7 @@ CONFIG = {
     # モデルパス
     "model_koopman_path": "/home/mizutani/projects/RF/runs/20260127_014201/model_weights_20260127_014201.pth",
     "model_ablation_path": "/home/mizutani/projects/RF/runs/20260127_014847/ablation_weights_20260127_014847.pth",
-    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation_0303_thr8",
+    "output_dir": "/home/mizutani/projects/RF/runs/20260127_014201/evaluation_0304_thr6",
 
 
     "plot_max_samples": 1000,
@@ -87,7 +88,7 @@ CONFIG = {
     "prefix_lengths": [5],  # 複数のPrefix長で評価
     
     # ★★★ 短期/長期の閾値 ★★★
-    "short_long_threshold": 8,  # gen_lenの長期・短期の閾値
+    "short_long_threshold": 6,  # gen_lenの長期・短期の閾値
     
     # Context Logic
     "holidays": [20240928, 20240929, 20251122, 20251123],
@@ -99,6 +100,25 @@ CONFIG = {
         (20251123, 10, 16, [2])
     ],
 }
+
+parser = argparse.ArgumentParser(description="Inference/Eval for DKP_RF with optional overrides")
+parser.add_argument("--model-koopman-path", type=str, default=None)
+parser.add_argument("--model-ablation-path", type=str, default=None)
+parser.add_argument("--output-dir", type=str, default=None)
+parser.add_argument("--eval-data", type=str, default=None, choices=["TRAIN", "VAL", "TEST"])
+parser.add_argument("--prefix-lengths", type=str, default=None, help="comma separated, e.g. 2,3,4,5")
+args = parser.parse_args()
+
+if args.model_koopman_path is not None:
+    CONFIG["model_koopman_path"] = args.model_koopman_path
+if args.model_ablation_path is not None:
+    CONFIG["model_ablation_path"] = args.model_ablation_path
+if args.output_dir is not None:
+    CONFIG["output_dir"] = args.output_dir
+if args.eval_data is not None:
+    CONFIG["eval_data"] = args.eval_data
+if args.prefix_lengths is not None:
+    CONFIG["prefix_lengths"] = [int(x.strip()) for x in args.prefix_lengths.split(",") if x.strip()]
 
 
 # 2-hop Adjacency Map
@@ -816,6 +836,8 @@ def main():
         pad_token_id=koopman_config["pad_token_id"],
         base_N=koopman_config["base_N"],
         use_aux_loss=koopman_config.get("use_aux_loss", False),
+        encoder_type=koopman_config.get("encoder_type", "transformer"),
+        max_prefix_len=int(koopman_config.get("max_prefix_len", max(CONFIG["prefix_lengths"]))),
     ).to(device)
     
     model_koopman.load_state_dict(koopman_checkpoint["model_state_dict"])
@@ -899,6 +921,22 @@ def main():
             pred_k = eval_koopman.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
             pred_a = eval_ablation.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
 
+            # --- [NEW] Sequence-level accuracy over the whole predicted future ---
+            # We use mean per-step accuracy (not product) to avoid values vanishing with longer sequences.
+            gt_future_arr = np.asarray(gt_future, dtype=np.int64)
+            pred_k_arr = np.asarray(pred_k, dtype=np.int64)
+            pred_a_arr = np.asarray(pred_a, dtype=np.int64)
+            _L = len(gt_future_arr)
+            _Lk = len(pred_k_arr)
+            _La = len(pred_a_arr)
+            _Lmin_k = min(_L, _Lk)
+            _Lmin_a = min(_L, _La)
+            k_acc_seq = float((pred_k_arr[:_Lmin_k] == gt_future_arr[:_Lmin_k]).mean()) if _Lmin_k > 0 else float('nan')
+            # ↑こんな書き方できるのか．．．その経路の，未来部分全体の平均トークン正解率（0〜1）
+            a_acc_seq = float((pred_a_arr[:_Lmin_a] == gt_future_arr[:_Lmin_a]).mean()) if _Lmin_a > 0 else float('nan')
+            k_len_mismatch = int(_Lk != _L)
+            a_len_mismatch = int(_La != _L)
+
             # ★追加: <end>が出るまで最後まで生成（Koopman/Ablation）
             pred_k_full = []
             pred_a_full = []
@@ -969,6 +1007,20 @@ def main():
 
             
             # メトリクス保存
+            k_ed_raw = calc_levenshtein(gt_future, pred_k)
+            a_ed_raw = calc_levenshtein(gt_future, pred_a)
+            k_ged_raw = calc_levenshtein(gt_future, pred_k, geo=True)
+            a_ged_raw = calc_levenshtein(gt_future, pred_a, geo=True)
+            k_ged2_raw = calc_levenshtein(gt_future, pred_k, geo=True, relaxed=True)
+            a_ged2_raw = calc_levenshtein(gt_future, pred_a, geo=True, relaxed=True)
+            k_dtw_raw = calc_dtw(gt_future, pred_k)
+            a_dtw_raw = calc_dtw(gt_future, pred_a)
+            k_gdtw_raw = calc_dtw(gt_future, pred_k, geo=True)
+            a_gdtw_raw = calc_dtw(gt_future, pred_a, geo=True)
+            k_gdtw2_raw = calc_dtw(gt_future, pred_k, geo=True, relaxed=True)
+            a_gdtw2_raw = calc_dtw(gt_future, pred_a, geo=True, relaxed=True)
+            norm_den = float(max(gen_len, 1))
+
             metrics_list.append({
                 'id': idx,
                 'prefix_len': prefix_len,
@@ -989,30 +1041,53 @@ def main():
 
                 
                 # 次トークン予測
-                'k_acc': 1 if acc_k else 0,
+                # 'k_acc': 1 if acc_k else 0,
                 'k_prob': prob_k,
-                'a_acc': 1 if acc_a else 0,
+                # 'a_acc': 1 if acc_a else 0,
                 'a_prob': prob_a,
-                
+
+                # Accuracy (sequence-level; mean over all future steps)
+                'k_acc': k_acc_seq,
+                'a_acc': a_acc_seq,
+                # (kept for reference) Next-token accuracy/probability at the first future step only
+                'k_acc_next1': 1 if acc_k else 0,
+                'a_acc_next1': 1 if acc_a else 0,
+                'k_len_mismatch': k_len_mismatch,
+                'a_len_mismatch': a_len_mismatch,
+
                 # Edit Distance (Normal & Geo)
-                'k_ed': calc_levenshtein(gt_future, pred_k),
-                'a_ed': calc_levenshtein(gt_future, pred_a),
-                'k_ged': calc_levenshtein(gt_future, pred_k, geo=True),
-                'a_ged': calc_levenshtein(gt_future, pred_a, geo=True),
+                'k_ed': k_ed_raw,
+                'a_ed': a_ed_raw,
+                'k_ged': k_ged_raw,
+                'a_ged': a_ged_raw,
                 
                 # ★追加: Relaxed Geo-ED (geoED2)
-                'k_ged2': calc_levenshtein(gt_future, pred_k, geo=True, relaxed=True),
-                'a_ged2': calc_levenshtein(gt_future, pred_a, geo=True, relaxed=True),
+                'k_ged2': k_ged2_raw,
+                'a_ged2': a_ged2_raw,
                 
                 # DTW (Normal & Geo)
-                'k_dtw': calc_dtw(gt_future, pred_k),
-                'a_dtw': calc_dtw(gt_future, pred_a),
-                'k_gdtw': calc_dtw(gt_future, pred_k, geo=True),
-                'a_gdtw': calc_dtw(gt_future, pred_a, geo=True),
+                'k_dtw': k_dtw_raw,
+                'a_dtw': a_dtw_raw,
+                'k_gdtw': k_gdtw_raw,
+                'a_gdtw': a_gdtw_raw,
                 
                 # ★追加: Relaxed Geo-DTW (geoDTW2)
-                'k_gdtw2': calc_dtw(gt_future, pred_k, geo=True, relaxed=True),
-                'a_gdtw2': calc_dtw(gt_future, pred_a, geo=True, relaxed=True),
+                'k_gdtw2': k_gdtw2_raw,
+                'a_gdtw2': a_gdtw2_raw,
+
+                # 正規化版（prefix差の比較用）
+                'k_ed_norm': k_ed_raw / norm_den,
+                'a_ed_norm': a_ed_raw / norm_den,
+                'k_ged_norm': k_ged_raw / norm_den,
+                'a_ged_norm': a_ged_raw / norm_den,
+                'k_ged2_norm': k_ged2_raw / norm_den,
+                'a_ged2_norm': a_ged2_raw / norm_den,
+                'k_dtw_norm': k_dtw_raw / norm_den,
+                'a_dtw_norm': a_dtw_raw / norm_den,
+                'k_gdtw_norm': k_gdtw_raw / norm_den,
+                'a_gdtw_norm': a_gdtw_raw / norm_den,
+                'k_gdtw2_norm': k_gdtw2_raw / norm_den,
+                'a_gdtw2_norm': a_gdtw2_raw / norm_den,
                 
                 # 滞在指標
                 'k_stay_rate': k_rate if k_rate is not None else np.nan,
@@ -1083,28 +1158,19 @@ def main():
         print(f"  [Next Token] Acc:      Koopman={d['k_acc'].mean():.4f} | Ablation={d['a_acc'].mean():.4f}")
         print(f"  [Next Token] Prob:     Koopman={d['k_prob'].mean():.4f} | Ablation={d['a_prob'].mean():.4f}")
         
-        k_ed = (d['k_ed'] / d['gen_len']).mean()
-        a_ed = (d['a_ed'] / d['gen_len']).mean()
-        k_ged = (d['k_ged'] / d['gen_len']).mean()
-        a_ged = (d['a_ged'] / d['gen_len']).mean()
-        # ★追加: ged2
-        k_ged2 = (d['k_ged2'] / d['gen_len']).mean()
-        a_ged2 = (d['a_ged2'] / d['gen_len']).mean()
-        
-        k_dtw = (d['k_dtw'] / d['gen_len']).mean()
-        a_dtw = (d['a_dtw'] / d['gen_len']).mean()
-        k_gdtw = (d['k_gdtw'] / d['gen_len']).mean()
-        a_gdtw = (d['a_gdtw'] / d['gen_len']).mean()
-        # ★追加: gdtw2
-        k_gdtw2 = (d['k_gdtw2'] / d['gen_len']).mean()
-        a_gdtw2 = (d['a_gdtw2'] / d['gen_len']).mean()
-        
-        print(f"  [Gen] ED (norm):       Koopman={k_ed:.4f} | Ablation={a_ed:.4f}")
-        print(f"  [Gen] Geo-ED (norm):   Koopman={k_ged:.4f} | Ablation={a_ged:.4f}")
-        print(f"  [Gen] Geo-ED2 (norm):  Koopman={k_ged2:.4f} | Ablation={a_ged2:.4f}  (Relaxed: 0 if <=2hop)")
-        print(f"  [Gen] DTW (norm):      Koopman={k_dtw:.4f} | Ablation={a_dtw:.4f}")
-        print(f"  [Gen] Geo-DTW (norm):  Koopman={k_gdtw:.4f} | Ablation={a_gdtw:.4f}")
-        print(f"  [Gen] Geo-DTW2 (norm): Koopman={k_gdtw2:.4f} | Ablation={a_gdtw2:.4f}  (Relaxed: 0 if <=2hop)")
+        print(f"  [Gen Raw] ED:          Koopman={d['k_ed'].mean():.4f} | Ablation={d['a_ed'].mean():.4f}")
+        print(f"  [Gen Raw] Geo-ED:      Koopman={d['k_ged'].mean():.4f} | Ablation={d['a_ged'].mean():.4f}")
+        print(f"  [Gen Raw] Geo-ED2:     Koopman={d['k_ged2'].mean():.4f} | Ablation={d['a_ged2'].mean():.4f}")
+        print(f"  [Gen Raw] DTW:         Koopman={d['k_dtw'].mean():.4f} | Ablation={d['a_dtw'].mean():.4f}")
+        print(f"  [Gen Raw] Geo-DTW:     Koopman={d['k_gdtw'].mean():.4f} | Ablation={d['a_gdtw'].mean():.4f}")
+        print(f"  [Gen Raw] Geo-DTW2:    Koopman={d['k_gdtw2'].mean():.4f} | Ablation={d['a_gdtw2'].mean():.4f}")
+
+        print(f"  [Gen Norm] ED:         Koopman={d['k_ed_norm'].mean():.4f} | Ablation={d['a_ed_norm'].mean():.4f}")
+        print(f"  [Gen Norm] Geo-ED:     Koopman={d['k_ged_norm'].mean():.4f} | Ablation={d['a_ged_norm'].mean():.4f}")
+        print(f"  [Gen Norm] Geo-ED2:    Koopman={d['k_ged2_norm'].mean():.4f} | Ablation={d['a_ged2_norm'].mean():.4f}")
+        print(f"  [Gen Norm] DTW:        Koopman={d['k_dtw_norm'].mean():.4f} | Ablation={d['a_dtw_norm'].mean():.4f}")
+        print(f"  [Gen Norm] Geo-DTW:    Koopman={d['k_gdtw_norm'].mean():.4f} | Ablation={d['a_gdtw_norm'].mean():.4f}")
+        print(f"  [Gen Norm] Geo-DTW2:   Koopman={d['k_gdtw2_norm'].mean():.4f} | Ablation={d['a_gdtw2_norm'].mean():.4f}  (Relaxed: 0 if <=2hop)")
         
         print("  [Stay Metrics] (Detected Stays Only)")
         print(f"    Detection Rate:      Koopman={d['k_stay_rate'].mean():.4f} | Ablation={d['a_stay_rate'].mean():.4f}")
