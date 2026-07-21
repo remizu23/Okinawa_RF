@@ -3,6 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+from context_modes import (
+    ContextAblationConfig,
+    compute_u,
+)
+
 class EmbeddingWithFeatures(nn.Module): # Koopmanでは不使用
     def __init__(self, vocab_size, token_dim, feature_dim=None, feature_emb_dim=None, dropout=0.1):
         super(EmbeddingWithFeatures, self).__init__()
@@ -67,6 +72,9 @@ class KoopmanRoutesFormer(nn.Module):
         use_aux_loss=False,  # 補助損失を使うかどうか
         encoder_type: str = "transformer",
         max_prefix_len: int = 8,
+        context_ablation: ContextAblationConfig | None = None,
+        stay_u_threshold: int = 3,
+        context_config: dict | None = None,
     ):
         super().__init__()
         
@@ -113,8 +121,21 @@ class KoopmanRoutesFormer(nn.Module):
         if self.encoder_type not in {"transformer", "lstm", "mlp_flat"}:
             raise ValueError(f"Unsupported encoder_type: {self.encoder_type}")
 
+        self.context_ablation = context_ablation or ContextAblationConfig()
+        self.stay_u_threshold = int(stay_u_threshold)
+        self.context_config = context_config
+        self.uses_dual_A = self.context_ablation.uses_dual_A
+
         # Koopman Dynamics (B行列は削除)
-        self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
+        if self.uses_dual_A:
+            self.A0 = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
+            self.delta_A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
+        else:
+            self.A = nn.Parameter(torch.randn(z_dim, z_dim) * 0.05)
+
+        # u shuffle control (training only)
+        self._u_perm: torch.Tensor | None = None
+        self._random_u_labels: bool = False
 
         # 補助損失用のヘッド
         if use_aux_loss:
@@ -141,6 +162,43 @@ class KoopmanRoutesFormer(nn.Module):
             self.candidate_base_id = None
             self.delta_gate = None
             self.delta_bin_weight = None
+
+    def set_u_permutation(self, u_perm: torch.Tensor | None) -> None:
+        """Set epoch-fixed u permutation for random-u-label control (training)."""
+        self._u_perm = u_perm
+
+    def set_random_u_labels(self, enabled: bool) -> None:
+        self._random_u_labels = bool(enabled)
+
+    def _embed_context_feature(self, name: str, indices: torch.Tensor, embedding: nn.Embedding):
+        vec = embedding(indices)
+        if self.context_ablation.should_zero_embed(name):
+            return torch.zeros_like(vec)
+        return vec
+
+    def compute_u(
+        self,
+        prefix_stay_counts: torch.Tensor,
+        prefix_times: torch.Tensor | None = None,
+        prefix_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return compute_u(
+            self.context_ablation,
+            prefix_stay_counts,
+            prefix_times=prefix_times,
+            prefix_mask=prefix_mask,
+            context_config=self.context_config,
+        )
+
+    def get_A_for_u(self, u: torch.Tensor) -> torch.Tensor:
+        """Return effective A matrices [B, z_dim, z_dim]."""
+        if not self.uses_dual_A:
+            return self.A.unsqueeze(0).expand(u.shape[0], -1, -1)
+        u_col = u.view(-1, 1, 1)
+        return self.A0.unsqueeze(0) + u_col * self.delta_A.unsqueeze(0)
+
+    def _apply_koopman_step(self, z: torch.Tensor, A_eff: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(z.unsqueeze(1), A_eff.transpose(1, 2)).squeeze(1)
 
     def encode_prefix(
         self, 
@@ -172,8 +230,8 @@ class KoopmanRoutesFormer(nn.Module):
 
         # 埋め込み
         token_vec = self.token_embedding(prefix_tokens)
-        stay_vec = self.stay_embedding(prefix_stay_counts)
-        
+        stay_vec = self._embed_context_feature("stay", prefix_stay_counts, self.stay_embedding)
+
         # agent_ids の形状処理
         if prefix_agent_ids.dim() == 1:
             agent_vec = self.agent_embedding(prefix_agent_ids)
@@ -182,8 +240,10 @@ class KoopmanRoutesFormer(nn.Module):
             agent_vec = self.agent_embedding(prefix_agent_ids)
 
         holiday_vec = self.holiday_embedding(prefix_holidays)
-        timezone_vec = self.time_zone_embedding(prefix_time_zones)
-        event_vec = self.event_embedding(prefix_events)
+        timezone_vec = self._embed_context_feature(
+            "timezone", prefix_time_zones, self.time_zone_embedding
+        )
+        event_vec = self._embed_context_feature("event", prefix_events, self.event_embedding)
 
         u_all = torch.cat([
             token_vec, stay_vec, agent_vec, 
@@ -246,6 +306,8 @@ class KoopmanRoutesFormer(nn.Module):
         future_tokens=None,  # 学習時の正解データ [B, K]
         prefix_mask=None,
         prefix_times=None,
+        u_override=None,
+        sample_indices=None,
     ):
         """
         Koopman 自律ロールアウト (B項なし)
@@ -299,28 +361,41 @@ class KoopmanRoutesFormer(nn.Module):
             # 損失計算
             aux_losses['count'] = F.cross_entropy(count_logits, last_stay_counts)
             aux_losses['mode'] = F.cross_entropy(mode_logits, last_mode)
-        
+
+        # u for conditional A (M2)
+        u = self.compute_u(prefix_stay_counts, prefix_times, prefix_mask)
+        if u_override is not None:
+            u = u_override.to(u.device, dtype=u.dtype)
+        elif (
+            self.training
+            and self._random_u_labels
+            and self._u_perm is not None
+            and sample_indices is not None
+        ):
+            u = self._u_perm[sample_indices.to(self._u_perm.device)].to(u.device)
+
+        A_eff = self.get_A_for_u(u)  # [B, z_dim, z_dim]
+
         # 3. Koopman 自律ロールアウト
         z = z_0
         logits_list = []
         z_list = [z_0]  # ★追加：z_0 から保持
-        
-        for k in range(K):
-            # A行列のみで発展（B項なし）
-            z = z @ self.A.T  # [B, z_dim]
-            z_list.append(z)  # ★追加
 
-            # ロジット出力
+        for _k in range(K):
+            z = self._apply_koopman_step(z, A_eff)
+            z_list.append(z)
+
             logits = self.to_logits(z)  # [B, vocab]
             logits_list.append(logits)
-        
+
         pred_logits = torch.stack(logits_list, dim=1)  # [B, K, vocab]
-        
+
         return {
             'pred_logits': pred_logits,
             'z_0': z_0,
             "z_traj": torch.stack(z_list, dim=1),  # ★追加: [B, K+1, z_dim]
             'aux_losses': aux_losses,
+            'u': u,
         }
 
     def calc_geo_loss(self, logits, targets):

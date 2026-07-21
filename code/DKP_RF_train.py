@@ -1,3 +1,11 @@
+"""
+7/20:A分化に対応．（run_condition_ablation_grid.py）
+このコード単体で評価実行する場合は↓．（event条件でAを分ける場合：）
+python DKP_RF_train.py \
+  --condition-feature event --condition-mode M2 \
+  --fixed-prefix-length 5 --z-dim 32 --out-dir /path/to/train
+"""
+
 from seaborn.matrix import dendrogram
 import argparse
 import json
@@ -11,6 +19,7 @@ import wandb
 import os
 from datetime import datetime
 from DKP_RF import KoopmanRoutesFormer  # ★修正版モデルを使用
+from context_modes import ContextAblationConfig, compute_u, DEFAULT_CONTEXT_CONFIG
 # 自作モジュール
 from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
@@ -73,6 +82,12 @@ wandb.config = type("C", (), {
     # ★ 再現性設定
     "seed": 42,
     "deterministic_cuda": False, # CUDA由来の揺らぎ：Trueにすると遅くなるがランダム性なくなる．
+
+    # ★ Context ablation (M0/M1/M2)
+    "condition_feature": "none",
+    "condition_mode": "M1",
+    "stay_u_threshold": 3,
+    "random_u_labels": False,
 })()
 
 # =======================================================
@@ -88,6 +103,10 @@ parser.add_argument("--fixed-prefix-length", type=int, default=None)
 parser.add_argument("--encoder-type", type=str, default=None, choices=["transformer", "lstm", "mlp_flat"])
 parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--deterministic-cuda", action="store_true")
+parser.add_argument("--condition-feature", type=str, default=None, choices=["none", "event", "timezone", "stay"])
+parser.add_argument("--condition-mode", type=str, default=None, choices=["M0", "M1", "M2"])
+parser.add_argument("--stay-u-threshold", type=int, default=None)
+parser.add_argument("--random-u-labels", action="store_true")
 cli_args, _unknown = parser.parse_known_args()
 
 if cli_args.epochs is not None:
@@ -106,6 +125,14 @@ if cli_args.seed is not None:
     wandb.config.seed = int(cli_args.seed)
 if bool(cli_args.deterministic_cuda):
     wandb.config.deterministic_cuda = True
+if cli_args.condition_feature is not None:
+    wandb.config.condition_feature = str(cli_args.condition_feature)
+if cli_args.condition_mode is not None:
+    wandb.config.condition_mode = str(cli_args.condition_mode)
+if cli_args.stay_u_threshold is not None:
+    wandb.config.stay_u_threshold = int(cli_args.stay_u_threshold)
+if bool(cli_args.random_u_labels):
+    wandb.config.random_u_labels = True
 
 # =======================================================
 # 1-1.5 乱数シード固定（再現性）
@@ -334,13 +361,16 @@ class VariablePrefixDataset(torch.utils.data.Dataset): # 2-2-1．可変長のデ
                     'future': future_data,
                     'prefix_len': prefix_len,
                     'future_len': real_len - prefix_len,
+                    'sample_idx': len(self.samples),
                 })
     
     def __len__(self):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        return self.samples[idx]
+        item = self.samples[idx]
+        item['sample_idx'] = idx
+        return item
 
 # ========================================
 # 2-2-2．固定長prefixのデータセットクラス
@@ -402,6 +432,7 @@ class FixedPrefixDataset(torch.utils.data.Dataset): # 2-2-2．固定長prefixの
             'future': future_data,
             'prefix_len': self.prefix_len,
             'future_len': real_len - self.prefix_len,
+            'sample_idx': idx,
         }
 
 # ========================================
@@ -432,7 +463,8 @@ def collate_variable_prefix(batch): # 2-2-3．バッチ内のサンプル長を�
     
     times = []
     agents = []
-    
+    sample_indices = []
+
     for i, item in enumerate(batch):
         plen = item['prefix_len']
         flen = item['future_len']
@@ -446,6 +478,7 @@ def collate_variable_prefix(batch): # 2-2-3．バッチ内のサンプル長を�
         
         times.append(item['prefix']['time'])
         agents.append(item['prefix']['agent'])
+        sample_indices.append(item.get('sample_idx', i))
         
         # Future
         future_tokens[i, :flen] = item['future']['tokens']
@@ -462,6 +495,7 @@ def collate_variable_prefix(batch): # 2-2-3．バッチ内のサンプル長を�
         'prefix_mask': prefix_mask,
         'prefix_agents': torch.tensor(agents, dtype=torch.long),
         'times': torch.tensor(times),
+        'sample_indices': torch.tensor(sample_indices, dtype=torch.long),
         'future_tokens': future_tokens,
         'future_holidays': future_holidays,
         'future_timezones': future_timezones,
@@ -614,6 +648,13 @@ else:
 
 print(f"[Model] encoder_type={wandb.config.encoder_type}, max_prefix_len={max_prefix_len}")
 
+context_ablation = ContextAblationConfig(
+    target=wandb.config.condition_feature,
+    mode=wandb.config.condition_mode,
+    stay_u_threshold=wandb.config.stay_u_threshold,
+)
+print(f"[ContextAblation] {context_ablation.to_dict()}, random_u_labels={wandb.config.random_u_labels}")
+
 model = KoopmanRoutesFormer(
     vocab_size=vocab_size,
     token_emb_dim=wandb.config.d_ie, 
@@ -635,8 +676,13 @@ model = KoopmanRoutesFormer(
     use_aux_loss=use_aux_loss,
     encoder_type=wandb.config.encoder_type,
     max_prefix_len=max_prefix_len,
+    context_ablation=context_ablation,
+    stay_u_threshold=wandb.config.stay_u_threshold,
+    context_config=DEFAULT_CONTEXT_CONFIG,
 
 ).to(device)
+
+model.set_random_u_labels(wandb.config.random_u_labels)
 
 print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -669,11 +715,36 @@ history = {  # 値の履歴辞書
     "train_count": [], "val_count": [],
     "train_mode": [], "val_mode": [],
     "train_lyap": [], "val_lyap": [],
+    "val_loss_u0": [], "val_loss_u1": [],
 }
+
+def _init_epoch_u_perm():
+    """Build epoch-fixed u permutation over train dataset indices."""
+    if not (wandb.config.random_u_labels and context_ablation.uses_dual_A):
+        model.set_u_permutation(None)
+        return
+    n = len(train_dataset)
+    perm = torch.randperm(n, generator=loader_generator)
+    # Precompute u values for all train samples
+    u_all = []
+    model.eval()
+    with torch.no_grad():
+        for idx in range(n):
+            item = train_dataset[idx]
+            tokens = item['prefix']['tokens'].unsqueeze(0)
+            stay = tokenizer.calculate_stay_counts(tokens)
+            t = item['prefix']['time'].unsqueeze(0) if hasattr(item['prefix']['time'], 'unsqueeze') else torch.tensor([item['prefix']['time']])
+            u = compute_u(context_ablation, stay, prefix_times=t, context_config=DEFAULT_CONTEXT_CONFIG)
+            u_all.append(u.item())
+    model.train()
+    u_tensor = torch.tensor(u_all, dtype=torch.float32)
+    shuffled_u = u_tensor[perm]
+    model.set_u_permutation(shuffled_u)
 
 for epoch in range(wandb.config.epochs):
     # --- ①Training ---
     model.train()
+    _init_epoch_u_perm()
 
     # 現在epochに応じてp_tfが変わる設定．
     # u(t)実装時のスケジュールサンプリングの名残．今，model内でp_tfは使っていないため，謎の変数定義がされて終わるだけのパート．
@@ -704,6 +775,7 @@ for epoch in range(wandb.config.epochs):
         future_tokens = batch['future_tokens'].to(device)
         future_mask = batch['future_mask'].to(device)
         times = batch["times"].to(device)   # 追加
+        sample_indices = batch["sample_indices"].to(device)
         
         # 滞在カウント計算
         prefix_stay_counts = tokenizer.calculate_stay_counts(prefix_tokens).to(device)
@@ -726,6 +798,7 @@ for epoch in range(wandb.config.epochs):
             future_tokens=future_tokens[:, :K],
             prefix_mask=prefix_mask,
             prefix_times=times,
+            sample_indices=sample_indices,
         )
         
         pred_logits = outputs['pred_logits']  # [B(バッチサイズ), K(予測ステップ数), vocab_size]
@@ -810,7 +883,9 @@ for epoch in range(wandb.config.epochs):
     model.eval()
     epoch_metrics_val = {
         "loss": 0.0, "ce": 0.0, "geo": 0.0,
-        "count": 0.0, "mode": 0.0, "lyap": 0.0
+        "count": 0.0, "mode": 0.0, "lyap": 0.0,
+        "loss_u0": 0.0, "loss_u1": 0.0,
+        "n_u0": 0, "n_u1": 0,
     }
     
     with torch.no_grad():
@@ -886,6 +961,22 @@ for epoch in range(wandb.config.epochs):
                 wandb.config.aux_mode_weight * aux_mode_loss +
                 wandb.config.lyap_alpha * lyap_loss
             )
+
+            u_batch = outputs.get("u")
+            if u_batch is not None and context_ablation.uses_dual_A:
+                ce_per = nn.functional.cross_entropy(
+                    pred_logits.reshape(-1, vocab_size),
+                    future_tokens[:, :K].reshape(-1),
+                    reduction='none'
+                ).view(-1, K)
+                sample_ce = (ce_per * valid_mask.float()).sum(dim=1) / (valid_mask.float().sum(dim=1) + 1e-8)
+                for bi in range(u_batch.shape[0]):
+                    if u_batch[bi].item() < 0.5:
+                        epoch_metrics_val["loss_u0"] += sample_ce[bi].item()
+                        epoch_metrics_val["n_u0"] += 1
+                    else:
+                        epoch_metrics_val["loss_u1"] += sample_ce[bi].item()
+                        epoch_metrics_val["n_u1"] += 1
             
             epoch_metrics_val["loss"] += total_loss.item()
             epoch_metrics_val["ce"] += ce_loss.item()
@@ -905,6 +996,10 @@ for epoch in range(wandb.config.epochs):
     history["val_count"].append(epoch_metrics_val["count"] / den)
     history["val_mode"].append(epoch_metrics_val["mode"] / den)
     history["val_lyap"].append(epoch_metrics_val["lyap"] / den)
+    n0 = max(epoch_metrics_val["n_u0"], 1)
+    n1 = max(epoch_metrics_val["n_u1"], 1)
+    history["val_loss_u0"].append(epoch_metrics_val["loss_u0"] / n0 if epoch_metrics_val["n_u0"] > 0 else float("nan"))
+    history["val_loss_u1"].append(epoch_metrics_val["loss_u1"] / n1 if epoch_metrics_val["n_u1"] > 0 else float("nan"))
     
     print(f"Epoch {epoch+1}: Train Loss = {history['train_loss'][-1]:.4f} | Val Loss = {history['val_loss'][-1]:.4f}")
 
@@ -941,6 +1036,9 @@ save_data = {
         "fixed_prefix_length":wandb.config.fixed_prefix_length,
         "max_prefix_len": int(max_prefix_len),
         "encoder_type": str(wandb.config.encoder_type),
+        "context_ablation": context_ablation.to_dict(),
+        "stay_u_threshold": int(wandb.config.stay_u_threshold),
+        "random_u_labels": bool(wandb.config.random_u_labels),
     },
     "history": history,
     "split_sequences": {

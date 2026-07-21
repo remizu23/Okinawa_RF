@@ -2,6 +2,14 @@
 Inference and Evaluation Script
 KoopmanとAblationモデルの性能比較（反実仮想なし）
 
+7/20:A分化に対応．（run_condition_ablation_grid.py）
+このコード単体で評価実行する場合は↓．
+python DKP_RF_inf.py \
+  --model-koopman-path /path/to/model.pth \
+  --output-dir /path/to/eval --eval-data TEST \
+  --prefix-lengths 5 --eval-random-u  # A分化の効果が本当にあるか検証するため，ランダム分割データでも検証する
+
+
 元のKP_RF_inf_path_real.pyをベースに、以下に対応：
 - 3分割データ（Train/Val/Test）の選択
 - 可変Prefix長
@@ -30,6 +38,8 @@ from DKP_RF import KoopmanRoutesFormer
 from Transformer_Ablation import TransformerAblation
 from network import Network, expand_adjacency_matrix
 from tokenization import Tokenization
+from context_modes import ContextAblationConfig, compute_u_numpy, DEFAULT_CONTEXT_CONFIG
+from koopman_eigen import plot_model_eigenvalues
 
 # ★NEW: DwellU関数をインポート
 from utils_prism import summarize_dwell_metrics
@@ -107,6 +117,7 @@ parser.add_argument("--model-ablation-path", type=str, default=None)
 parser.add_argument("--output-dir", type=str, default=None)
 parser.add_argument("--eval-data", type=str, default=None, choices=["TRAIN", "VAL", "TEST"])
 parser.add_argument("--prefix-lengths", type=str, default=None, help="comma separated, e.g. 2,3,4,5")
+parser.add_argument("--eval-random-u", action="store_true", help="Also evaluate with shuffled u labels (M2)")
 args = parser.parse_args()
 
 if args.model_koopman_path is not None:
@@ -460,15 +471,17 @@ class ContextDeterminer:
 
 class KoopmanEvaluator:
     """Koopmanモデルの評価クラス"""
-    def __init__(self, model, tokenizer, ctx_det, device, base_N=19):
+    def __init__(self, model, tokenizer, ctx_det, device, base_N=19, context_ablation=None, u_override=None):
         self.model = model
         self.tokenizer = tokenizer
         self.ctx_det = ctx_det
         self.device = device
         self.base_N = base_N
+        self.context_ablation = context_ablation or ContextAblationConfig()
+        self.u_override = u_override  # scalar 0/1 or None
         self.model.eval()
     
-    def generate_trajectory(self, prompt_seq, start_time, agent_id, gen_len):
+    def generate_trajectory(self, prompt_seq, start_time, agent_id, gen_len, u_override=None):
         """
         prefix(=prompt_seq) を1回だけ transformer に入れて z0 を作り、
         以降は Koopman (A,B,u) で K=gen_len ステップ自律生成（Greedy）
@@ -490,6 +503,12 @@ class KoopmanEvaluator:
 
             prefix_times = torch.tensor([int(start_time)], dtype=torch.long, device=self.device)  # [1]
 
+            u_ov = u_override
+            if u_ov is None and self.u_override is not None:
+                u_ov = torch.tensor([float(self.u_override)], device=self.device)
+            elif u_ov is not None and not isinstance(u_ov, torch.Tensor):
+                u_ov = torch.tensor([float(u_ov)], device=self.device)
+
             outputs = self.model.forward_rollout(
                 prefix_tokens=tokens,
                 prefix_stay_counts=stay_counts,
@@ -499,7 +518,7 @@ class KoopmanEvaluator:
                 prefix_events=events,
                 prefix_times=prefix_times,
                 K=int(gen_len),
-                # future_tokens は渡さない（= 自律生成）
+                u_override=u_ov,
             )
 
             # outputs['pred_logits']: [1, K, vocab]
@@ -560,7 +579,7 @@ class KoopmanEvaluator:
             return generated
 
 
-    def calc_next_token_metrics(self, prompt_seq, gt_next, start_time, agent_id):
+    def calc_next_token_metrics(self, prompt_seq, gt_next, start_time, agent_id, u_override=None):
         """
         次トークン予測の精度・確率を計算
         """
@@ -579,6 +598,12 @@ class KoopmanEvaluator:
             agent_ids = torch.tensor([agent_id], dtype=torch.long).to(self.device)
 
             prefix_times = torch.tensor([int(start_time)], dtype=torch.long, device=self.device)  # [1]
+
+            u_ov = u_override
+            if u_ov is None and self.u_override is not None:
+                u_ov = torch.tensor([float(self.u_override)], device=self.device)
+            elif u_ov is not None and not isinstance(u_ov, torch.Tensor):
+                u_ov = torch.tensor([float(u_ov)], device=self.device)
             
             outputs = self.model.forward_rollout(
                 prefix_tokens=tokens,
@@ -588,7 +613,8 @@ class KoopmanEvaluator:
                 prefix_time_zones=time_zones,
                 prefix_events=events,
                 K=1,
-                prefix_times=prefix_times,   
+                prefix_times=prefix_times,
+                u_override=u_ov,
             )
             
             pred_logits = outputs['pred_logits'][0, 0, :]  # [vocab]
@@ -738,6 +764,57 @@ class AblationEvaluator:
             
             return accuracy, gt_prob
 # =========================================================
+# 3.5 Helpers for condition ablation eval
+# =========================================================
+
+SUMMARY_METRIC_COLS = [
+    "k_acc", "k_prob", "k_ed_norm", "k_ged_norm", "k_dtw_norm", "k_gdtw_norm",
+    "k_acc_next1", "k_ed", "k_ged", "k_dtw", "k_gdtw",
+]
+
+
+def summarize_by_condition(df: pd.DataFrame, metric_cols=None) -> pd.DataFrame:
+    """Aggregate metrics for u=0, u=1, and all."""
+    metric_cols = metric_cols or SUMMARY_METRIC_COLS
+    rows = []
+    for label, sub in [("u=0", df[df["condition_u"] == 0]), ("u=1", df[df["condition_u"] == 1]), ("all", df)]:
+        row = {"group": label, "num_samples": int(len(sub))}
+        for col in metric_cols:
+            if col in sub.columns and len(sub) > 0:
+                row[f"{col}_mean"] = float(sub[col].mean())
+            else:
+                row[f"{col}_mean"] = float("nan")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def build_koopman_model_from_checkpoint(checkpoint: dict, device, prefix_lengths):
+    cfg = checkpoint["config"]
+    context_ablation = ContextAblationConfig.from_dict(cfg.get("context_ablation"))
+    stay_u_threshold = int(cfg.get("stay_u_threshold", 3))
+    model = KoopmanRoutesFormer(
+        vocab_size=cfg["vocab_size"],
+        token_emb_dim=cfg["token_emb_dim"],
+        d_model=cfg["d_model"],
+        nhead=cfg["nhead"],
+        num_layers=cfg["num_layers"],
+        d_ff=cfg["d_ff"],
+        z_dim=cfg["z_dim"],
+        pad_token_id=cfg["pad_token_id"],
+        base_N=cfg["base_N"],
+        use_aux_loss=cfg.get("use_aux_loss", False),
+        encoder_type=cfg.get("encoder_type", "transformer"),
+        max_prefix_len=int(cfg.get("max_prefix_len", max(prefix_lengths))),
+        context_ablation=context_ablation,
+        stay_u_threshold=stay_u_threshold,
+        context_config=DEFAULT_CONTEXT_CONFIG,
+    ).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+    return model, context_ablation
+
+
+# =========================================================
 # 4. Main Evaluation Function
 # =========================================================
 
@@ -823,26 +900,11 @@ def main():
     # Koopmanモデル
     print("Loading Koopman model...")
     koopman_checkpoint = torch.load(CONFIG["model_koopman_path"], map_location=device, weights_only=False)
-    koopman_config = koopman_checkpoint["config"]
-    
-    model_koopman = KoopmanRoutesFormer(
-        vocab_size=koopman_config["vocab_size"],
-        token_emb_dim=koopman_config["token_emb_dim"],
-        d_model=koopman_config["d_model"],
-        nhead=koopman_config["nhead"],
-        num_layers=koopman_config["num_layers"],
-        d_ff=koopman_config["d_ff"],
-        z_dim=koopman_config["z_dim"],
-        pad_token_id=koopman_config["pad_token_id"],
-        base_N=koopman_config["base_N"],
-        use_aux_loss=koopman_config.get("use_aux_loss", False),
-        encoder_type=koopman_config.get("encoder_type", "transformer"),
-        max_prefix_len=int(koopman_config.get("max_prefix_len", max(CONFIG["prefix_lengths"]))),
-    ).to(device)
-    
-    model_koopman.load_state_dict(koopman_checkpoint["model_state_dict"])
-    model_koopman.eval()
+    model_koopman, context_ablation = build_koopman_model_from_checkpoint(
+        koopman_checkpoint, device, CONFIG["prefix_lengths"]
+    )
     print(f"Koopman model loaded. Parameters: {sum(p.numel() for p in model_koopman.parameters()):,}")
+    print(f"Context ablation: {context_ablation.to_dict() if context_ablation else {}}")
     
     # Ablationモデル
     print("Loading Ablation model...")
@@ -870,8 +932,17 @@ def main():
     tokenizer = Tokenization(network)
     ctx_det = ContextDeterminer(CONFIG)
     
-    eval_koopman = KoopmanEvaluator(model_koopman, tokenizer, ctx_det, device, base_N)
+    eval_koopman = KoopmanEvaluator(
+        model_koopman, tokenizer, ctx_det, device, base_N,
+        context_ablation=context_ablation,
+    )
     eval_ablation = AblationEvaluator(model_ablation, tokenizer, ctx_det, device, base_N)
+
+    # Eigenvalue plots
+    print("\n=== Plotting Koopman A eigenvalues ===")
+    eigen_paths = plot_model_eigenvalues(model_koopman, CONFIG["output_dir"])
+    for name, p in eigen_paths.items():
+        print(f"  Saved eigenvalues ({name}): {p}")
     
     # =====================================================
     # 評価ループ
@@ -882,263 +953,317 @@ def main():
     
     # 各Prefix長ごとに評価
     all_results = []
-    
-    for prefix_len in CONFIG["prefix_lengths"]:
-        print(f"\n--- Evaluating with Prefix Length = {prefix_len} ---")
-        
-        metrics_list = []
-        
-        for idx in tqdm(eval_seq_indices, desc=f"Prefix={prefix_len}"):
-            seq = trip_arr[idx]
-            start_time = time_arr[idx]
-            agent_id = agent_ids_arr[idx]
-            
-            # パディングを除去
-            pad_indices = np.where(seq == CONFIG["pad_token"])[0]
-            seq_len = pad_indices[0] if len(pad_indices) > 0 else len(seq)
-            seq = seq[:seq_len]
-            
-            # Prefix長が十分か確認
-            if seq_len <= prefix_len:
-                continue
-            
-            # Prefix と Future に分割
-            prompt_seq = seq[:prefix_len].tolist()
-            gt_future = seq[prefix_len:].tolist()
-            
-            if len(gt_future) == 0:
-                continue
-            
-            # Task 1: 次トークン予測
-            gt_next = gt_future[0]
-            
-            acc_k, prob_k = eval_koopman.calc_next_token_metrics(prompt_seq, gt_next, start_time, agent_id)
-            acc_a, prob_a = eval_ablation.calc_next_token_metrics(prompt_seq, gt_next, start_time, agent_id)
-            
-            # Task 2: 系列生成
-            gen_len = len(gt_future)
-            
-            pred_k = eval_koopman.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
-            pred_a = eval_ablation.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
+    eval_modes = [("true_u", None)]
+    if args.eval_random_u and context_ablation and context_ablation.uses_dual_A:
+        eval_modes.append(("random_u", "random"))
 
-            # --- [NEW] Sequence-level accuracy over the whole predicted future ---
-            # We use mean per-step accuracy (not product) to avoid values vanishing with longer sequences.
-            gt_future_arr = np.asarray(gt_future, dtype=np.int64)
-            pred_k_arr = np.asarray(pred_k, dtype=np.int64)
-            pred_a_arr = np.asarray(pred_a, dtype=np.int64)
-            _L = len(gt_future_arr)
-            _Lk = len(pred_k_arr)
-            _La = len(pred_a_arr)
-            _Lmin_k = min(_L, _Lk)
-            _Lmin_a = min(_L, _La)
-            k_acc_seq = float((pred_k_arr[:_Lmin_k] == gt_future_arr[:_Lmin_k]).mean()) if _Lmin_k > 0 else float('nan')
-            # ↑こんな書き方できるのか．．．その経路の，未来部分全体の平均トークン正解率（0〜1）
-            a_acc_seq = float((pred_a_arr[:_Lmin_a] == gt_future_arr[:_Lmin_a]).mean()) if _Lmin_a > 0 else float('nan')
-            k_len_mismatch = int(_Lk != _L)
-            a_len_mismatch = int(_La != _L)
+    for u_mode_label, u_mode in eval_modes:
+        if u_mode == "random":
+            print("\n=== Additional evaluation with shuffled u labels ===")
+        for prefix_len in CONFIG["prefix_lengths"]:
+            print(f"\n--- Evaluating with Prefix Length = {prefix_len} ({u_mode_label}) ---")
 
-            # ★追加: <end>が出るまで最後まで生成（Koopman/Ablation）
-            pred_k_full = []
-            pred_a_full = []
-            pred_k_sample_topk = []
-            pred_a_sample_topk = []
+            metrics_list = []
+            precomputed = []
+            for idx in eval_seq_indices:
+                seq = trip_arr[idx]
+                start_time = time_arr[idx]
+                pad_indices = np.where(seq == CONFIG["pad_token"])[0]
+                seq_len = pad_indices[0] if len(pad_indices) > 0 else len(seq)
+                seq = seq[:seq_len]
+                if seq_len <= prefix_len:
+                    continue
+                prompt_seq = seq[:prefix_len].tolist()
+                tokens_t = torch.tensor([prompt_seq], dtype=torch.long)
+                stay_np = tokenizer.calculate_stay_counts(tokens_t).cpu().numpy()[0]
+                u_val = compute_u_numpy(context_ablation, stay_np, int(start_time), DEFAULT_CONTEXT_CONFIG)
+                precomputed.append((idx, u_val))
 
-            # if idx < 400:
-            #     pred_k_full = eval_koopman.generate_trajectory_until_end(
-            #         prompt_seq, start_time, agent_id,
-            #         end_token_id=CONFIG["end_token"],
-            #         max_steps=CONFIG["max_gen_steps"],
-            #         mode="greedy",
-            #     )
-            #     pred_a_full = eval_ablation.generate_trajectory_until_end(
-            #         prompt_seq, start_time, agent_id,
-            #         end_token_id=CONFIG["end_token"],
-            #         max_steps=CONFIG["max_gen_steps"],
-            #     )
+            if u_mode == "random" and precomputed:
+                rng = np.random.default_rng(0)
+                shuffled = [u for _, u in precomputed]
+                rng.shuffle(shuffled)
+                u_map = {idx: shuffled[i] for i, (idx, _) in enumerate(precomputed)}
+            else:
+                u_map = {idx: u for idx, u in precomputed}
 
-            #     # ★追加: Top-k 確率サンプリングで <end> まで生成（Koopmanのみ）
-            #     pred_k_sample_topk = eval_koopman.generate_trajectory_until_end(
-            #         prompt_seq, start_time, agent_id,
-            #         end_token_id=CONFIG["end_token"],
-            #         max_steps=CONFIG["max_gen_steps"],
-            #         mode="topk",
-            #         topk_k=CONFIG["sample_topk_k"],
-            #     )
+            for idx in tqdm(eval_seq_indices, desc=f"Prefix={prefix_len} [{u_mode_label}]"):
+                seq = trip_arr[idx]
+                start_time = time_arr[idx]
+                agent_id = agent_ids_arr[idx]
+            
+                # パディングを除去
+                pad_indices = np.where(seq == CONFIG["pad_token"])[0]
+                seq_len = pad_indices[0] if len(pad_indices) > 0 else len(seq)
+                seq = seq[:seq_len]
+            
+                # Prefix長が十分か確認
+                if seq_len <= prefix_len:
+                    continue
+            
+                # Prefix と Future に分割
+                prompt_seq = seq[:prefix_len].tolist()
+                gt_future = seq[prefix_len:].tolist()
+            
+                if len(gt_future) == 0:
+                    continue
+            
+                # Task 1: 次トークン予測
+                gt_next = gt_future[0]
+
+                u_override = u_map.get(idx)
+                acc_k, prob_k = eval_koopman.calc_next_token_metrics(
+                    prompt_seq, gt_next, start_time, agent_id, u_override=u_override
+                )
+                acc_a, prob_a = eval_ablation.calc_next_token_metrics(prompt_seq, gt_next, start_time, agent_id)
+
+                # Task 2: 系列生成
+                gen_len = len(gt_future)
+
+                pred_k = eval_koopman.generate_trajectory(
+                    prompt_seq, start_time, agent_id, gen_len, u_override=u_override
+                )
+                pred_a = eval_ablation.generate_trajectory(prompt_seq, start_time, agent_id, gen_len)
+
+                # --- [NEW] Sequence-level accuracy over the whole predicted future ---
+                # We use mean per-step accuracy (not product) to avoid values vanishing with longer sequences.
+                gt_future_arr = np.asarray(gt_future, dtype=np.int64)
+                pred_k_arr = np.asarray(pred_k, dtype=np.int64)
+                pred_a_arr = np.asarray(pred_a, dtype=np.int64)
+                _L = len(gt_future_arr)
+                _Lk = len(pred_k_arr)
+                _La = len(pred_a_arr)
+                _Lmin_k = min(_L, _Lk)
+                _Lmin_a = min(_L, _La)
+                k_acc_seq = float((pred_k_arr[:_Lmin_k] == gt_future_arr[:_Lmin_k]).mean()) if _Lmin_k > 0 else float('nan')
+                # ↑こんな書き方できるのか．．．その経路の，未来部分全体の平均トークン正解率（0〜1）
+                a_acc_seq = float((pred_a_arr[:_Lmin_a] == gt_future_arr[:_Lmin_a]).mean()) if _Lmin_a > 0 else float('nan')
+                k_len_mismatch = int(_Lk != _L)
+                a_len_mismatch = int(_La != _L)
+
+                # ★追加: <end>が出るまで最後まで生成（Koopman/Ablation）
+                pred_k_full = []
+                pred_a_full = []
+                pred_k_sample_topk = []
+                pred_a_sample_topk = []
+
+                # if idx < 400:
+                #     pred_k_full = eval_koopman.generate_trajectory_until_end(
+                #         prompt_seq, start_time, agent_id,
+                #         end_token_id=CONFIG["end_token"],
+                #         max_steps=CONFIG["max_gen_steps"],
+                #         mode="greedy",
+                #     )
+                #     pred_a_full = eval_ablation.generate_trajectory_until_end(
+                #         prompt_seq, start_time, agent_id,
+                #         end_token_id=CONFIG["end_token"],
+                #         max_steps=CONFIG["max_gen_steps"],
+                #     )
+
+                #     # ★追加: Top-k 確率サンプリングで <end> まで生成（Koopmanのみ）
+                #     pred_k_sample_topk = eval_koopman.generate_trajectory_until_end(
+                #         prompt_seq, start_time, agent_id,
+                #         end_token_id=CONFIG["end_token"],
+                #         max_steps=CONFIG["max_gen_steps"],
+                #         mode="topk",
+                #         topk_k=CONFIG["sample_topk_k"],
+                #     )
                 
-            #     # ★追加: Top-k 確率サンプリングで <end> まで生成（Ablation）
-            #     pred_a_sample_topk = eval_ablation.generate_trajectory_until_end(
-            #         prompt_seq, start_time, agent_id,
-            #         end_token_id=CONFIG["end_token"],
-            #         max_steps=CONFIG["max_gen_steps"],
-            #         mode="topk",
-            #         topk_k=CONFIG["sample_topk_k"],
-            #     )
+                #     # ★追加: Top-k 確率サンプリングで <end> まで生成（Ablation）
+                #     pred_a_sample_topk = eval_ablation.generate_trajectory_until_end(
+                #         prompt_seq, start_time, agent_id,
+                #         end_token_id=CONFIG["end_token"],
+                #         max_steps=CONFIG["max_gen_steps"],
+                #         mode="topk",
+                #         topk_k=CONFIG["sample_topk_k"],
+                #     )
 
-            # 滞在指標
-            stay_metrics_k = calc_stay_metrics_pair(gt_future, pred_k, NODE_DISTANCES)
-            stay_metrics_a = calc_stay_metrics_pair(gt_future, pred_a, NODE_DISTANCES)
+                # 滞在指標
+                stay_metrics_k = calc_stay_metrics_pair(gt_future, pred_k, NODE_DISTANCES)
+                stay_metrics_a = calc_stay_metrics_pair(gt_future, pred_a, NODE_DISTANCES)
             
-            k_rate, k_ldiff, k_labs, k_loc, k_cost = summarize_stay(stay_metrics_k)
-            a_rate, a_ldiff, a_labs, a_loc, a_cost = summarize_stay(stay_metrics_a)
+                k_rate, k_ldiff, k_labs, k_loc, k_cost = summarize_stay(stay_metrics_k)
+                a_rate, a_ldiff, a_labs, a_loc, a_cost = summarize_stay(stay_metrics_a)
             
-            # ★NEW: DwellU指標（圧縮版+実時間版）
-            dwell_metrics_k = summarize_dwell_metrics(pred_k, gt_future, base_N=base_N)
-            dwell_metrics_a = summarize_dwell_metrics(pred_a, gt_future, base_N=base_N)
+                # ★NEW: DwellU指標（圧縮版+実時間版）
+                dwell_metrics_k = summarize_dwell_metrics(pred_k, gt_future, base_N=base_N)
+                dwell_metrics_a = summarize_dwell_metrics(pred_a, gt_future, base_N=base_N)
 
-            # =====================================================
-            # [ADD] CSVに出したい「ルート付帯情報」
-            # =====================================================
+                # =====================================================
+                # [ADD] CSVに出したい「ルート付帯情報」
+                # =====================================================
 
-            # time_arr（このスクリプトでは各系列の start_time = time_arr[idx]）
-            time_value = int(start_time)
-
-            # 入力条件（全5列）
-            is_night = int(ctx_det.get_timezone(start_time))     # 1:夜, 0:昼
-            is_holiday = int(ctx_det.get_holiday(start_time))    # 1:休日, 0:平日
-
-            event_nodes = set(ctx_det.get_event_nodes(start_time))  # その時刻で有効なイベントノード
-            plaza_2  = 1 if 2  in event_nodes else 0
-            plaza_11 = 1 if 11 in event_nodes else 0
-            plaza_14 = 1 if 14 in event_nodes else 0
-
-            # 経路の最初/最後のトークン（padding除去後の seq を使う）
-            first_token = int(seq[0])
-            last_token  = int(seq[-1])
-
-            
-            # メトリクス保存
-            k_ed_raw = calc_levenshtein(gt_future, pred_k)
-            a_ed_raw = calc_levenshtein(gt_future, pred_a)
-            k_ged_raw = calc_levenshtein(gt_future, pred_k, geo=True)
-            a_ged_raw = calc_levenshtein(gt_future, pred_a, geo=True)
-            k_ged2_raw = calc_levenshtein(gt_future, pred_k, geo=True, relaxed=True)
-            a_ged2_raw = calc_levenshtein(gt_future, pred_a, geo=True, relaxed=True)
-            k_dtw_raw = calc_dtw(gt_future, pred_k)
-            a_dtw_raw = calc_dtw(gt_future, pred_a)
-            k_gdtw_raw = calc_dtw(gt_future, pred_k, geo=True)
-            a_gdtw_raw = calc_dtw(gt_future, pred_a, geo=True)
-            k_gdtw2_raw = calc_dtw(gt_future, pred_k, geo=True, relaxed=True)
-            a_gdtw2_raw = calc_dtw(gt_future, pred_a, geo=True, relaxed=True)
-            norm_den = float(max(gen_len, 1))
-
-            metrics_list.append({
-                'id': idx,
-                'prefix_len': prefix_len,
-                'gen_len': gen_len,
-                # --- [ADD] 付帯情報 ---
-                'time_arr': time_value,
+                # time_arr（このスクリプトでは各系列の start_time = time_arr[idx]）
+                time_value = int(start_time)
 
                 # 入力条件（全5列）
-                'is_night': is_night,           # 1:夜, 0:昼
-                'is_holiday': is_holiday,       # 1:休日, 0:平日
-                'plaza_node2': plaza_2,         # 1:有, 0:無
-                'plaza_node11': plaza_11,       # 1:有, 0:無
-                'plaza_node14': plaza_14,       # 1:有, 0:無
+                is_night = int(ctx_det.get_timezone(start_time))     # 1:夜, 0:昼
+                is_holiday = int(ctx_det.get_holiday(start_time))    # 1:休日, 0:平日
 
-                # 経路端点
-                'first_token': first_token,
-                'last_token': last_token,
+                event_nodes = set(ctx_det.get_event_nodes(start_time))  # その時刻で有効なイベントノード
+                plaza_2  = 1 if 2  in event_nodes else 0
+                plaza_11 = 1 if 11 in event_nodes else 0
+                plaza_14 = 1 if 14 in event_nodes else 0
+
+                # 経路の最初/最後のトークン（padding除去後の seq を使う）
+                first_token = int(seq[0])
+                last_token  = int(seq[-1])
+
+                tokens_t = torch.tensor([prompt_seq], dtype=torch.long)
+                stay_np = tokenizer.calculate_stay_counts(tokens_t).cpu().numpy()[0]
+                condition_u = int(u_map.get(idx, compute_u_numpy(
+                    context_ablation, stay_np, int(start_time), DEFAULT_CONTEXT_CONFIG
+                )))
+
+                # メトリクス保存
+                k_ed_raw = calc_levenshtein(gt_future, pred_k)
+                a_ed_raw = calc_levenshtein(gt_future, pred_a)
+                k_ged_raw = calc_levenshtein(gt_future, pred_k, geo=True)
+                a_ged_raw = calc_levenshtein(gt_future, pred_a, geo=True)
+                k_ged2_raw = calc_levenshtein(gt_future, pred_k, geo=True, relaxed=True)
+                a_ged2_raw = calc_levenshtein(gt_future, pred_a, geo=True, relaxed=True)
+                k_dtw_raw = calc_dtw(gt_future, pred_k)
+                a_dtw_raw = calc_dtw(gt_future, pred_a)
+                k_gdtw_raw = calc_dtw(gt_future, pred_k, geo=True)
+                a_gdtw_raw = calc_dtw(gt_future, pred_a, geo=True)
+                k_gdtw2_raw = calc_dtw(gt_future, pred_k, geo=True, relaxed=True)
+                a_gdtw2_raw = calc_dtw(gt_future, pred_a, geo=True, relaxed=True)
+                norm_den = float(max(gen_len, 1))
+
+                metrics_list.append({
+                    'id': idx,
+                    'prefix_len': prefix_len,
+                    'gen_len': gen_len,
+                    'u_eval_mode': u_mode_label,
+                    'condition_feature': context_ablation.target if context_ablation else "none",
+                    'condition_mode': context_ablation.mode if context_ablation else "M1",
+                    'condition_u': condition_u,
+                    # --- [ADD] 付帯情報 ---
+                    'time_arr': time_value,
+
+                    # 入力条件（全5列）
+                    'is_night': is_night,           # 1:夜, 0:昼
+                    'is_holiday': is_holiday,       # 1:休日, 0:平日
+                    'plaza_node2': plaza_2,         # 1:有, 0:無
+                    'plaza_node11': plaza_11,       # 1:有, 0:無
+                    'plaza_node14': plaza_14,       # 1:有, 0:無
+
+                    # 経路端点
+                    'first_token': first_token,
+                    'last_token': last_token,
 
                 
-                # 次トークン予測
-                # 'k_acc': 1 if acc_k else 0,
-                'k_prob': prob_k,
-                # 'a_acc': 1 if acc_a else 0,
-                'a_prob': prob_a,
+                    # 次トークン予測
+                    # 'k_acc': 1 if acc_k else 0,
+                    'k_prob': prob_k,
+                    # 'a_acc': 1 if acc_a else 0,
+                    'a_prob': prob_a,
 
-                # Accuracy (sequence-level; mean over all future steps)
-                'k_acc': k_acc_seq,
-                'a_acc': a_acc_seq,
-                # (kept for reference) Next-token accuracy/probability at the first future step only
-                'k_acc_next1': 1 if acc_k else 0,
-                'a_acc_next1': 1 if acc_a else 0,
-                'k_len_mismatch': k_len_mismatch,
-                'a_len_mismatch': a_len_mismatch,
+                    # Accuracy (sequence-level; mean over all future steps)
+                    'k_acc': k_acc_seq,
+                    'a_acc': a_acc_seq,
+                    # (kept for reference) Next-token accuracy/probability at the first future step only
+                    'k_acc_next1': 1 if acc_k else 0,
+                    'a_acc_next1': 1 if acc_a else 0,
+                    'k_len_mismatch': k_len_mismatch,
+                    'a_len_mismatch': a_len_mismatch,
 
-                # Edit Distance (Normal & Geo)
-                'k_ed': k_ed_raw,
-                'a_ed': a_ed_raw,
-                'k_ged': k_ged_raw,
-                'a_ged': a_ged_raw,
+                    # Edit Distance (Normal & Geo)
+                    'k_ed': k_ed_raw,
+                    'a_ed': a_ed_raw,
+                    'k_ged': k_ged_raw,
+                    'a_ged': a_ged_raw,
                 
-                # ★追加: Relaxed Geo-ED (geoED2)
-                'k_ged2': k_ged2_raw,
-                'a_ged2': a_ged2_raw,
+                    # ★追加: Relaxed Geo-ED (geoED2)
+                    'k_ged2': k_ged2_raw,
+                    'a_ged2': a_ged2_raw,
                 
-                # DTW (Normal & Geo)
-                'k_dtw': k_dtw_raw,
-                'a_dtw': a_dtw_raw,
-                'k_gdtw': k_gdtw_raw,
-                'a_gdtw': a_gdtw_raw,
+                    # DTW (Normal & Geo)
+                    'k_dtw': k_dtw_raw,
+                    'a_dtw': a_dtw_raw,
+                    'k_gdtw': k_gdtw_raw,
+                    'a_gdtw': a_gdtw_raw,
                 
-                # ★追加: Relaxed Geo-DTW (geoDTW2)
-                'k_gdtw2': k_gdtw2_raw,
-                'a_gdtw2': a_gdtw2_raw,
+                    # ★追加: Relaxed Geo-DTW (geoDTW2)
+                    'k_gdtw2': k_gdtw2_raw,
+                    'a_gdtw2': a_gdtw2_raw,
 
-                # 正規化版（prefix差の比較用）
-                'k_ed_norm': k_ed_raw / norm_den,
-                'a_ed_norm': a_ed_raw / norm_den,
-                'k_ged_norm': k_ged_raw / norm_den,
-                'a_ged_norm': a_ged_raw / norm_den,
-                'k_ged2_norm': k_ged2_raw / norm_den,
-                'a_ged2_norm': a_ged2_raw / norm_den,
-                'k_dtw_norm': k_dtw_raw / norm_den,
-                'a_dtw_norm': a_dtw_raw / norm_den,
-                'k_gdtw_norm': k_gdtw_raw / norm_den,
-                'a_gdtw_norm': a_gdtw_raw / norm_den,
-                'k_gdtw2_norm': k_gdtw2_raw / norm_den,
-                'a_gdtw2_norm': a_gdtw2_raw / norm_den,
+                    # 正規化版（prefix差の比較用）
+                    'k_ed_norm': k_ed_raw / norm_den,
+                    'a_ed_norm': a_ed_raw / norm_den,
+                    'k_ged_norm': k_ged_raw / norm_den,
+                    'a_ged_norm': a_ged_raw / norm_den,
+                    'k_ged2_norm': k_ged2_raw / norm_den,
+                    'a_ged2_norm': a_ged2_raw / norm_den,
+                    'k_dtw_norm': k_dtw_raw / norm_den,
+                    'a_dtw_norm': a_dtw_raw / norm_den,
+                    'k_gdtw_norm': k_gdtw_raw / norm_den,
+                    'a_gdtw_norm': a_gdtw_raw / norm_den,
+                    'k_gdtw2_norm': k_gdtw2_raw / norm_den,
+                    'a_gdtw2_norm': a_gdtw2_raw / norm_den,
                 
-                # 滞在指標
-                'k_stay_rate': k_rate if k_rate is not None else np.nan,
-                'k_stay_len_diff': k_ldiff if k_ldiff is not None else np.nan,
-                'k_stay_len_abs': k_labs if k_labs is not None else np.nan,
-                'k_stay_dist': k_loc if k_loc is not None else np.nan,
-                'k_stay_cost': k_cost if k_cost is not None else np.nan,
+                    # 滞在指標
+                    'k_stay_rate': k_rate if k_rate is not None else np.nan,
+                    'k_stay_len_diff': k_ldiff if k_ldiff is not None else np.nan,
+                    'k_stay_len_abs': k_labs if k_labs is not None else np.nan,
+                    'k_stay_dist': k_loc if k_loc is not None else np.nan,
+                    'k_stay_cost': k_cost if k_cost is not None else np.nan,
                 
-                'a_stay_rate': a_rate if a_rate is not None else np.nan,
-                'a_stay_len_diff': a_ldiff if a_ldiff is not None else np.nan,
-                'a_stay_len_abs': a_labs if a_labs is not None else np.nan,
-                'a_stay_dist': a_loc if a_loc is not None else np.nan,
-                'a_stay_cost': a_cost if a_cost is not None else np.nan,
+                    'a_stay_rate': a_rate if a_rate is not None else np.nan,
+                    'a_stay_len_diff': a_ldiff if a_ldiff is not None else np.nan,
+                    'a_stay_len_abs': a_labs if a_labs is not None else np.nan,
+                    'a_stay_dist': a_loc if a_loc is not None else np.nan,
+                    'a_stay_cost': a_cost if a_cost is not None else np.nan,
                 
-                # ★NEW: DwellU指標
-                'k_dwell_u': dwell_metrics_k['dwell_u'],
-                'k_dwell_u_all': dwell_metrics_k['dwell_u_all'],
-                'k_dwell_u_realtime': dwell_metrics_k['dwell_u_realtime'],
-                'k_dwell_u_all_realtime': dwell_metrics_k['dwell_u_all_realtime'],
-                'k_node_accuracy': dwell_metrics_k['node_accuracy'],
+                    # ★NEW: DwellU指標
+                    'k_dwell_u': dwell_metrics_k['dwell_u'],
+                    'k_dwell_u_all': dwell_metrics_k['dwell_u_all'],
+                    'k_dwell_u_realtime': dwell_metrics_k['dwell_u_realtime'],
+                    'k_dwell_u_all_realtime': dwell_metrics_k['dwell_u_all_realtime'],
+                    'k_node_accuracy': dwell_metrics_k['node_accuracy'],
                 
-                'a_dwell_u': dwell_metrics_a['dwell_u'],
-                'a_dwell_u_all': dwell_metrics_a['dwell_u_all'],
-                'a_dwell_u_realtime': dwell_metrics_a['dwell_u_realtime'],
-                'a_dwell_u_all_realtime': dwell_metrics_a['dwell_u_all_realtime'],
-                'a_node_accuracy': dwell_metrics_a['node_accuracy'],
+                    'a_dwell_u': dwell_metrics_a['dwell_u'],
+                    'a_dwell_u_all': dwell_metrics_a['dwell_u_all'],
+                    'a_dwell_u_realtime': dwell_metrics_a['dwell_u_realtime'],
+                    'a_dwell_u_all_realtime': dwell_metrics_a['dwell_u_all_realtime'],
+                    'a_node_accuracy': dwell_metrics_a['node_accuracy'],
                 
-                # 系列保存
-                'prompt': prompt_seq,
-                'gt': gt_future,
-                'pred_k': pred_k,
-                'pred_a': pred_a,
-                # ★追加: 最後まで生成した経路
-                'pred_k_full': pred_k_full,
-                'pred_a_full': pred_a_full,
-                # ★追加: Top-k サンプリングで最後まで生成した経路（Koopman）
-                'pred_k_sample_topk': pred_k_sample_topk,
-                'pred_a_sample_topk': pred_a_sample_topk,
-            })
+                    # 系列保存
+                    'prompt': prompt_seq,
+                    'gt': gt_future,
+                    'pred_k': pred_k,
+                    'pred_a': pred_a,
+                    # ★追加: 最後まで生成した経路
+                    'pred_k_full': pred_k_full,
+                    'pred_a_full': pred_a_full,
+                    # ★追加: Top-k サンプリングで最後まで生成した経路（Koopman）
+                    'pred_k_sample_topk': pred_k_sample_topk,
+                    'pred_a_sample_topk': pred_a_sample_topk,
+                })
         
         # DataFrameに変換
         df = pd.DataFrame(metrics_list)
-        
+
+        suffix = "" if u_mode_label == "true_u" else f"_{u_mode_label}"
+
         # CSV保存
-        csv_path = os.path.join(CONFIG["output_dir"], f"metrics_prefix{prefix_len}.csv")
+        csv_path = os.path.join(CONFIG["output_dir"], f"metrics_prefix{prefix_len}{suffix}.csv")
         df.to_csv(csv_path, index=False)
         print(f"Saved metrics to: {csv_path}")
-        
+
+        # 条件別集計
+        if context_ablation and context_ablation.is_active:
+            by_cond = summarize_by_condition(df)
+            by_cond_path = os.path.join(
+                CONFIG["output_dir"], f"metrics_by_condition_prefix{prefix_len}{suffix}.csv"
+            )
+            by_cond.to_csv(by_cond_path, index=False)
+            print(f"Saved condition summary to: {by_cond_path}")
+
         all_results.append({
             'prefix_len': prefix_len,
-            'df': df
+            'u_eval_mode': u_mode_label,
+            'df': df,
         })
     
     # =====================================================
