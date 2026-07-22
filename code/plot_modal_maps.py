@@ -9,8 +9,8 @@ move / stay の score・probability を地図上に可視化する。
   2. python plot_modal_maps.py
   → checkpoint から M2 なら A0+A1、M0/M1 なら shared A を自動選択
   → auto_mode_jobs=True なら |λ|≥閾値の全モードを自動ジョブ化
-  → 全 SCENARIOS × 全 operator × 全 MODE_JOBS を実行し、
-    out_dir/{scenario_name}/{operator}/ に図と meta JSON を保存
+  → output_format で csv / figures / both を選択
+  → 全 SCENARIOS × 全 operator × 全 MODE_JOBS を実行
 
 出力図（各 1 枚の 3行×T列マルチパネル）:
   - real_mode_probability / real_mode_score
@@ -20,6 +20,7 @@ move / stay の score・probability を地図上に可視化する。
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import sys
@@ -60,7 +61,8 @@ CONFIG: dict[str, Any] = {
 
     # 共通ロールアウト設定
     "horizon": 5,
-    "output_type": "both",  # "score" | "probability" | "both"
+    "output_type": "both",         # "score" | "probability" | "both"（値の種類）
+    "output_format": "csv",        # "csv" | "figures" | "both"（CSVのみ / 図のみ / 両方）
 
     # モードジョブ自動生成（True なら MODE_JOBS は使わない）
     "auto_mode_jobs": True,
@@ -1017,6 +1019,132 @@ def plot_modal_map_grid(
     return out_path
 
 
+SUMMARY_CSV_COLUMNS = [
+    "scenario_name",
+    "prefix",
+    "operator_variant",
+    "mode_job_name",
+    "mode_type",
+    "mode_index",
+    "eigenvalue_real",
+    "eigenvalue_imag",
+    "eigenvalue_abs",
+    "perturbation",
+    "value_kind",
+    "time_step",
+    "node_id",
+    "token_type",
+    "token_id",
+    "lon",
+    "lat",
+    "baseline",
+    "perturbed",
+    "delta",
+]
+
+
+def _perturbation_label(mode_type: str, alpha, gamma, delta) -> str:
+    if mode_type == "real":
+        return f"alpha={alpha:.6g}" if alpha is not None else ""
+    if mode_type == "complex_amplitude":
+        return f"gamma={gamma}" if gamma is not None else ""
+    if mode_type == "complex_phase":
+        return f"delta={delta:.6g}" if delta is not None else ""
+    return ""
+
+
+def build_modal_value_summary_rows(
+    *,
+    sample: dict[str, Any],
+    mode_job: dict[str, Any],
+    mode_type: str,
+    mode_idx: int,
+    lam: complex,
+    op_tag: str,
+    job_name: str,
+    horizon: int,
+    base_N: int,
+    active_node_ids: list[int],
+    coords: dict[int, tuple[float, float]],
+    base_roll: dict[str, np.ndarray],
+    pert_roll: dict[str, np.ndarray],
+    value_kinds: list[str],
+    alpha=None,
+    gamma=None,
+    delta=None,
+) -> list[dict[str, Any]]:
+    """move/stay の baseline / perturbed / delta を long 形式で返す。"""
+    rows: list[dict[str, Any]] = []
+    prefix_str = _prefix_tag(sample["tokens"])
+    scen_name = str(sample.get("name", prefix_str))
+    perturbation = _perturbation_label(mode_type, alpha, gamma, delta)
+
+    for value_kind in value_kinds:
+        key = "scores" if value_kind == "score" else "probs"
+        for t in range(horizon):
+            base_ms = extract_move_stay_values(
+                base_roll[key][t], num_nodes=base_N, stay_offset=base_N
+            )
+            pert_ms = extract_move_stay_values(
+                pert_roll[key][t], num_nodes=base_N, stay_offset=base_N
+            )
+            for nid in active_node_ids:
+                if nid not in coords:
+                    continue
+                lon, lat = coords[nid]
+                for token_type, arr_key in (("move", "move"), ("stay", "stay")):
+                    b = float(base_ms[arr_key][nid])
+                    p = float(pert_ms[arr_key][nid])
+                    token_id = int(nid if token_type == "move" else nid + base_N)
+                    rows.append({
+                        "scenario_name": scen_name,
+                        "prefix": prefix_str,
+                        "operator_variant": op_tag,
+                        "mode_job_name": job_name,
+                        "mode_type": mode_type,
+                        "mode_index": int(mode_idx),
+                        "eigenvalue_real": float(lam.real),
+                        "eigenvalue_imag": float(lam.imag),
+                        "eigenvalue_abs": float(abs(lam)),
+                        "perturbation": perturbation,
+                        "value_kind": value_kind,
+                        "time_step": int(t + 1),
+                        "node_id": int(nid),
+                        "token_type": token_type,
+                        "token_id": token_id,
+                        "lon": float(lon),
+                        "lat": float(lat),
+                        "baseline": b,
+                        "perturbed": p,
+                        "delta": p - b,
+                    })
+    return rows
+
+
+def save_summary_csv(path: str | Path, rows: list[dict[str, Any]]) -> str:
+    """サマリー CSV を保存。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=SUMMARY_CSV_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Saved summary CSV: {path} ({len(rows)} rows)")
+    return str(path)
+
+
+def _resolve_output_format(cfg: dict[str, Any]) -> tuple[bool, bool]:
+    """(emit_figures, emit_csv) を返す。"""
+    fmt = str(cfg.get("output_format", "both")).lower()
+    if fmt == "csv":
+        return False, True
+    if fmt == "figures":
+        return True, False
+    if fmt == "both":
+        return True, True
+    raise ValueError(f"未知の output_format: {fmt}")
+
+
 def save_modal_map_metadata(path: str | Path, meta: dict[str, Any]) -> str:
     path = str(path)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -1152,8 +1280,35 @@ def run_one_job(
         "complex_phase": "complex_phase",
     }[mode_type]
     job_name = str(mode_job.get("name", f"{mode_tag}_m{mode_idx}"))
-    saved: dict[str, Any] = {"figures": {}, "metadata": None, "job_name": job_name}
+    emit_figures, emit_csv = _resolve_output_format(cfg)
+    saved: dict[str, Any] = {
+        "figures": {},
+        "metadata": None,
+        "job_name": job_name,
+        "summary_rows": [],
+    }
     title = None
+
+    summary_rows = build_modal_value_summary_rows(
+        sample=sample,
+        mode_job=mode_job,
+        mode_type=mode_type,
+        mode_idx=mode_idx,
+        lam=lam,
+        op_tag=op_tag,
+        job_name=job_name,
+        horizon=horizon,
+        base_N=base_N,
+        active_node_ids=active_node_ids,
+        coords=coords,
+        base_roll=base_roll,
+        pert_roll=pert_roll,
+        value_kinds=output_types,
+        alpha=alpha,
+        gamma=gamma,
+        delta=delta,
+    )
+    saved["summary_rows"] = summary_rows
 
     for value_kind in output_types:
         key = "scores" if value_kind == "score" else "probs"
@@ -1166,9 +1321,6 @@ def run_one_job(
             for t in range(horizon)
         ]
 
-        fig_stem = f"{mode_tag}_{value_kind}_m{mode_idx}_{op_tag}_h{horizon}_{prefix_tag}"
-        fig_path = out_dir / f"{fig_stem}.png"
-
         if mode_type == "real":
             pert_desc = f"α={alpha:.4g}"
         elif mode_type == "complex_amplitude":
@@ -1179,6 +1331,12 @@ def run_one_job(
             f"{mode_type} | {value_kind} | mode={mode_idx} λ={lam.real:.3f}{lam.imag:+.3f}j"
             f" | {pert_desc} | op={op_tag} | prefix=[{prefix_tag}]"
         )
+
+        if not emit_figures:
+            continue
+
+        fig_stem = f"{mode_tag}_{value_kind}_m{mode_idx}_{op_tag}_h{horizon}_{prefix_tag}"
+        fig_path = out_dir / f"{fig_stem}.png"
 
         plot_modal_map_grid(
             baseline_by_t=base_maps,
@@ -1229,6 +1387,8 @@ def run_one_job(
         "operator_variant": op_tag,
         "horizon": horizon,
         "output_type": output_type,
+        "output_format": str(cfg.get("output_format", "both")),
+        "summary_row_count": len(summary_rows),
         "z0_norm": float(np.linalg.norm(z0)),
         "z0_perturbed_norm": float(np.linalg.norm(z0_p)),
         "z_tilde0_selected": {
@@ -1257,9 +1417,10 @@ def run_one_job(
             "Complex modes are always updated as conjugate pairs.",
         ],
     }
-    meta_path = out_dir / f"{mode_tag}_m{mode_idx}_{op_tag}_h{horizon}_{prefix_tag}_meta.json"
-    save_modal_map_metadata(meta_path, meta)
-    saved["metadata"] = str(meta_path)
+    if emit_figures or emit_csv:
+        meta_path = out_dir / f"{mode_tag}_m{mode_idx}_{op_tag}_h{horizon}_{prefix_tag}_meta.json"
+        save_modal_map_metadata(meta_path, meta)
+        saved["metadata"] = str(meta_path)
     return saved
 
 
@@ -1292,11 +1453,14 @@ def main():
     active_node_ids = get_active_node_ids(base_N)
     operators = resolve_operator_variants(model)
 
+    emit_figures, emit_csv = _resolve_output_format(cfg)
+
     print("=" * 60)
     print("Modal map visualization")
     print(f"checkpoint: {cfg['checkpoint']}")
     print(f"out_dir:    {out_root}")
     print(f"operators:  {[tag for tag, _ in operators]}")
+    print(f"output_format: {cfg.get('output_format', 'both')}")
     print(f"active_nodes: {active_node_ids} (excluded: {EXCLUDED_NODE_IDS})")
     print(f"auto_jobs:  {auto_jobs}")
     if auto_jobs:
@@ -1325,6 +1489,7 @@ def main():
 
     success = 0
     failed = 0
+    all_summary_rows: list[dict[str, Any]] = []
     for op_tag, a in operators:
         eigen = eigendecompose_operator(a)
         eigvals, v, v_inv = eigen["eigvals"], eigen["V"], eigen["V_inv"]
@@ -1363,7 +1528,7 @@ def main():
                 )
                 print(f"  [JOB] {job_name}")
                 try:
-                    run_one_job(
+                    result = run_one_job(
                         model=model,
                         tokenizer=tokenizer,
                         base_adj=base_adj,
@@ -1381,6 +1546,8 @@ def main():
                         out_dir=scen_out,
                         device=device,
                     )
+                    if emit_csv:
+                        all_summary_rows.extend(result.get("summary_rows", []))
                     success += 1
                 except Exception as e:
                     failed += 1
@@ -1392,8 +1559,14 @@ def main():
                         raise RuntimeError(msg) from e
                     print(msg)
 
+    if emit_csv and all_summary_rows:
+        summary_path = out_root / "summary_modal_values.csv"
+        save_summary_csv(summary_path, all_summary_rows)
+
     print("\n" + "=" * 60)
     print(f"Done. success={success}, failed={failed}")
+    if emit_csv:
+        print(f"Summary CSV rows: {len(all_summary_rows)}")
     print(f"Output root: {out_root}")
     print("=" * 60)
 
